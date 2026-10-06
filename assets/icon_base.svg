@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- The badge, reduced to its essentials: a black ring and a flat green field
+       (a minimal take on the original dragon99z logo). The white stripes live in
+       icon_stripes.svg so make_icon.py can tuck them behind the dragon. -->
+  <defs>
+    <radialGradient id="field" cx="0.62" cy="0.58" r="0.7">
+      <stop offset="0" stop-color="#1F8A3E"/>
+      <stop offset="1" stop-color="#0B3319"/>
+    </radialGradient>
+  </defs>
+  <circle cx="500" cy="530" r="470" fill="#050805"/>
+  <circle cx="500" cy="530" r="416" fill="url(#field)"/>
+</svg>

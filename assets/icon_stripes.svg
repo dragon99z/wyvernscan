@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Three white stripes, clipped to the badge's green field. make_icon.py draws
+       this layer behind the dragon and hides it inside the open mouth, so the
+       stripes read as passing behind the head. -->
+  <defs>
+    <clipPath id="inner"><circle cx="500" cy="530" r="416"/></clipPath>
+  </defs>
+  <g clip-path="url(#inner)" fill="#F1F3F1">
+    <g transform="translate(800 880) rotate(36)">
+      <rect x="-520" y="-98" width="1040" height="48"/>
+      <rect x="-520" y="-24" width="1040" height="48"/>
+      <rect x="-520" y="50" width="1040" height="48"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,89 @@
+# Builds and tests WyvernScan on Windows, Linux and macOS, and keeps the
+# resulting binaries as downloadable artifacts. Push a tag like `v0.1.0` to
+# also publish them as a GitHub Release.
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          # An older Ubuntu on purpose: a binary built against an older glibc
+          # also runs on newer distros, but not the other way round.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+          - name: macos-universal
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      # --- Windows ---------------------------------------------------------
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir dist
+          cp target/release/wyvernscan.exe dist/
+
+      # --- Linux -----------------------------------------------------------
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          mkdir dist
+          tar -czf dist/wyvernscan-linux-x86_64.tar.gz -C target/release wyvernscan
+
+      # --- macOS: one universal binary for Apple Silicon and Intel ----------
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir dist
+          lipo -create -output dist/wyvernscan \
+            target/aarch64-apple-darwin/release/wyvernscan \
+            target/x86_64-apple-darwin/release/wyvernscan
+          tar -czf dist/wyvernscan-macos-universal.tar.gz -C dist wyvernscan
+          rm dist/wyvernscan
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wyvernscan-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

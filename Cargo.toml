@@ -1,0 +1,31 @@
+[package]
+name = "wyvernscan"
+version = "0.1.0"
+edition = "2021"
+description = "WyvernScan - a fast disk space explorer with a live treemap, an NTFS MFT fast scan, and a headless CLI"
+build = "build.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[dependencies]
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.27"
+egui_extras = "0.27"
+num_cpus = "1.16"
+humansize = "2.1"
+rfd = "0.14"
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Build-time only, Windows hosts only: embeds assets/icon.ico into the .exe.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
