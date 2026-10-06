@@ -9,18 +9,33 @@
 //! Same reasoning for the timestamp — a small hand-rolled UTC calendar
 //! conversion instead of adding `chrono`/`time` just to format one string.
 
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static ITEM_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-thread counter for `log_item`.
+///
+/// This is intentionally thread-local rather than a process-global atomic.
+/// A scan resets its own budget at the beginning of the scan, and all
+/// per-item logging performed by that scan happens on the same scan thread.
+/// Keeping the counter thread-local means a parallel test/scan cannot reset
+/// another thread's budget.
+///
+/// This also preserves the existing `reset_item_budget()` API, so callers
+/// do not need to change.
+thread_local! {
+    static ITEM_LOGS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Per-scan cap on `log_item` lines, so a volume with millions of unreadable
 /// entries can't produce a multi-gigabyte log.
 const MAX_ITEM_LOGS: usize = 2000;
+
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 pub fn is_enabled() -> bool {
@@ -41,17 +56,25 @@ pub fn init() {
         .and_then(|p| p.parent().map(|d| d.join("wyvernscan-debug.log")))
         .unwrap_or_else(|| std::env::temp_dir().join("wyvernscan-debug.log"));
 
-    let file = OpenOptions::new().create(true).append(true).open(&path).ok();
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok();
+
     let opened_path = path.display().to_string();
     let _ = LOG_FILE.set(Mutex::new(file));
 
     install_panic_hook();
 
-    log(&format!("=== WyvernScan debug session started; logging to {opened_path} ==="));
+    log(&format!(
+        "=== WyvernScan debug session started; logging to {opened_path} ==="
+    ));
 }
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
+
     std::panic::set_hook(Box::new(move |info| {
         log(&format!("PANIC: {info}"));
         default_hook(info);
@@ -62,39 +85,61 @@ pub fn log(message: &str) {
     if !is_enabled() {
         return;
     }
+
     let stamped = format!("[{}] {}", timestamp(), message);
+
     println!("{stamped}");
+
     if let Some(mutex) = LOG_FILE.get() {
         write_stamped_line(mutex, &stamped);
     }
 }
 
 /// Log one *per-item* problem (a directory that couldn't be read, a corrupt
-/// record) — the things behind the "N errors" count in a finished scan. At
-/// most `MAX_ITEM_LOGS` are written per scan; after that a single notice says
-/// the rest are suppressed (the scan's own error count stays exact).
+/// record) — the things behind the "N errors" count in a finished scan.
+///
+/// At most `MAX_ITEM_LOGS` are written per scan/thread; after that a single
+/// notice says the rest are suppressed (the scan's own error count stays
+/// exact).
+///
+/// The counter is thread-local, so parallel scans/tests have independent
+/// budgets and cannot reset one another's counters.
+///
 /// Returns whether `message` was actually logged.
 pub fn log_item(message: &str) -> bool {
     if !is_enabled() {
         return false;
     }
-    let n = ITEM_LOGS.fetch_add(1, Ordering::Relaxed);
-    if n < MAX_ITEM_LOGS {
-        log(message);
-        true
-    } else {
-        if n == MAX_ITEM_LOGS {
-            log(&format!(
-                "... more than {MAX_ITEM_LOGS} per-item messages; the rest are suppressed (the error count is still exact)"
-            ));
+
+    ITEM_LOGS.with(|count| {
+        let n = count.get();
+        count.set(n.saturating_add(1));
+
+        if n < MAX_ITEM_LOGS {
+            log(message);
+            true
+        } else {
+            if n == MAX_ITEM_LOGS {
+                log(&format!(
+                    "... more than {MAX_ITEM_LOGS} per-item messages; \
+                     the rest are suppressed (the error count is still exact)"
+                ));
+            }
+
+            false
         }
-        false
-    }
+    })
 }
 
 /// Start a fresh `log_item` budget; called at the start of each scan.
+///
+/// The budget is thread-local, so resetting it only affects the scan/test
+/// running on the current thread. This makes the logging budget safe when
+/// Rust's test harness runs tests in parallel.
 pub fn reset_item_budget() {
-    ITEM_LOGS.store(0, Ordering::Relaxed);
+    ITEM_LOGS.with(|count| {
+        count.set(0);
+    });
 }
 
 /// The actual file-writing step, pulled out of `log()` so it can be tested
@@ -133,9 +178,16 @@ fn timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
+
     let (y, mo, d) = civil_from_days((now.as_secs() / 86400) as i64);
     let secs_of_day = now.as_secs() % 86400;
-    let (h, mi, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+
+    let (h, mi, s) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
 }
 
@@ -144,15 +196,37 @@ fn timestamp() -> String {
 /// date/time crate for just this one conversion.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+
+    let era = if z >= 0 {
+        z
+    } else {
+        z - 146096
+    } / 146097;
+
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
+
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+
+    let m = if mp < 10 {
+        mp + 3
+    } else {
+        mp - 9
+    } as u32;
+
+    (
+        if m <= 2 {
+            y + 1
+        } else {
+            y
+        },
+        m,
+        d,
+    )
 }
 
 #[cfg(test)]
@@ -163,37 +237,65 @@ mod tests {
     fn civil_from_days_matches_known_dates() {
         // 1970-01-01 is day 0 by definition.
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+
         // 2000-03-01 is a well-known reference date for this algorithm.
         assert_eq!(civil_from_days(11017), (2000, 3, 1));
     }
 
     /// Exercises the actual file-writing path end to end against a real
     /// temp file, rather than just trusting the logic by inspection.
+    ///
+    /// The test deliberately leaves the Rust test harness free to run this
+    /// in parallel with other tests. `ITEM_LOGS` is thread-local, so another
+    /// test calling `reset_item_budget()` cannot interfere with this test.
     #[test]
     fn per_item_logging_is_capped_and_resettable() {
         ENABLED.store(true, Ordering::Relaxed);
+
         reset_item_budget();
-        let logged = (0..MAX_ITEM_LOGS + 50).filter(|i| log_item(&format!("item {i}"))).count();
+
+        let logged = (0..MAX_ITEM_LOGS + 50)
+            .filter(|i| log_item(&format!("item {i}")))
+            .count();
+
         assert_eq!(logged, MAX_ITEM_LOGS);
+
         reset_item_budget();
+
         assert!(log_item("fresh budget"));
+
         ENABLED.store(false, Ordering::Relaxed);
+
         assert!(!log_item("disabled"));
     }
 
     #[test]
     fn write_stamped_line_appends_to_file() {
-        let path = std::env::temp_dir().join(format!("wyvernscan_debug_log_test_{}.log", std::process::id()));
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(&path).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "wyvernscan_debug_log_test_{}.log",
+            std::process::id()
+        ));
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+
         let mutex = Mutex::new(Some(file));
 
         write_stamped_line(&mutex, "first line");
         write_stamped_line(&mutex, "second line");
 
         let contents = std::fs::read_to_string(&path).unwrap();
+
         assert!(contents.contains("first line"));
         assert!(contents.contains("second line"));
-        assert!(contents.find("first line").unwrap() < contents.find("second line").unwrap());
+        assert!(
+            contents.find("first line").unwrap()
+                < contents.find("second line").unwrap()
+        );
 
         std::fs::remove_file(&path).unwrap();
     }
