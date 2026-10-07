@@ -1,7 +1,9 @@
 //! Minimal debug logging, active only when the process is launched with
-//! `--debug`. Every call to `log()` is written to stdout (which, on
-//! Windows, is a console window freshly allocated for this — see
-//! `main.rs`) and appended to a log file next to the executable.
+//! `--debug`. Every call to `log()` is written to the console and appended
+//! to a log file next to the executable. The console is stdout for the GUI
+//! (on Windows a console window freshly allocated for this — see `main.rs`)
+//! but **stderr in `--cli` mode** (`route_to_stderr`), so `--json` output on
+//! stdout is never mixed with log lines.
 //!
 //! Deliberately hand-rolled instead of pulling in `log`/`tracing`/
 //! `env_logger`: the ask here is "print it and also save it to a file",
@@ -17,17 +19,24 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static TO_STDERR: AtomicBool = AtomicBool::new(false);
 
-/// Per-thread counter for `log_item`.
-///
-/// This is intentionally thread-local rather than a process-global atomic.
-/// A scan resets its own budget at the beginning of the scan, and all
-/// per-item logging performed by that scan happens on the same scan thread.
-/// Keeping the counter thread-local means a parallel test/scan cannot reset
-/// another thread's budget.
-///
-/// This also preserves the existing `reset_item_budget()` API, so callers
-/// do not need to change.
+/// Send console log lines to stderr instead of stdout. Called for `--cli`
+/// before `init()`: stdout carries the report there (`--json > report.json`).
+pub fn route_to_stderr() {
+    TO_STDERR.store(true, Ordering::Relaxed);
+}
+
+// Per-thread counter for `log_item`.
+//
+// This is intentionally thread-local rather than a process-global atomic.
+// A scan resets its own budget at the beginning of the scan, and all
+// per-item logging performed by that scan happens on the same scan thread.
+// Keeping the counter thread-local means a parallel test/scan cannot reset
+// another thread's budget.
+//
+// This also preserves the existing `reset_item_budget()` API, so callers
+// do not need to change.
 thread_local! {
     static ITEM_LOGS: Cell<usize> = const { Cell::new(0) };
 }
@@ -50,26 +59,100 @@ pub fn is_enabled() -> bool {
 /// message before the default handler also prints it.
 pub fn init() {
     ENABLED.store(true, Ordering::Relaxed);
-
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("wyvernscan-debug.log")))
-        .unwrap_or_else(|| std::env::temp_dir().join("wyvernscan-debug.log"));
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok();
-
-    let opened_path = path.display().to_string();
-    let _ = LOG_FILE.set(Mutex::new(file));
-
     install_panic_hook();
 
-    log(&format!(
-        "=== WyvernScan debug session started; logging to {opened_path} ==="
+    // Next to the executable first, then the temp dir (the executable's
+    // folder is often read-only, e.g. /usr/local/bin or Program Files).
+    let name = "wyvernscan-debug.log";
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        candidates.push(dir.join(name));
+    }
+    candidates.push(std::env::temp_dir().join(name));
+
+    let mut failures = Vec::new();
+    let mut opened: Option<(std::path::PathBuf, std::fs::File)> = None;
+    for path in candidates {
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => {
+                opened = Some((path, f));
+                break;
+            }
+            Err(e) => failures.push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    let (where_to, file) = match opened {
+        Some((p, f)) => (format!("logging to {}", p.display()), Some(f)),
+        None => ("console only, no log file could be created".to_string(), None),
+    };
+    let _ = LOG_FILE.set(Mutex::new(file));
+
+    log(&format!("=== WyvernScan debug session started; {where_to} ==="));
+    for f in failures {
+        log(&format!("could not open log file {f}"));
+    }
+    log_system_info();
+}
+
+/// Facts that explain most "works here, not there" reports: version, OS,
+/// environment (WSL/container), user, CPU count, terminal state, arguments.
+/// Pure data gathering, so it is testable.
+pub fn system_info_lines() -> Vec<String> {
+    use std::io::IsTerminal;
+    let mut v = Vec::new();
+    v.push(format!(
+        "WyvernScan {} ({}/{}, {} build)",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if cfg!(debug_assertions) { "debug" } else { "release" }
     ));
+    v.push(format!("arguments: {:?}", std::env::args().skip(1).collect::<Vec<_>>()));
+    if let Ok(exe) = std::env::current_exe() {
+        v.push(format!("executable: {}", exe.display()));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        v.push(format!("working directory: {}", cwd.display()));
+    }
+    v.push(format!(
+        "process id {}, {} CPU(s) (scan worker threads: {})",
+        std::process::id(),
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        num_cpus::get()
+    ));
+    v.push(format!(
+        "stdout is a terminal: {}, stderr is a terminal: {}",
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal()
+    ));
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        v.push(format!(
+            "effective user id {uid}{} -- unreadable folders are counted as errors",
+            if uid == 0 { " (root)" } else { " (not root)" }
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let wsl = osrelease.to_lowercase().contains("microsoft");
+        v.push(format!("kernel {osrelease}{}", if wsl { " (WSL)" } else { "" }));
+        if std::path::Path::new("/.dockerenv").exists() {
+            v.push("running inside a Docker container".to_string());
+        }
+    }
+    v
+}
+
+pub fn log_system_info() {
+    for line in system_info_lines() {
+        log(&line);
+    }
 }
 
 fn install_panic_hook() {
@@ -88,7 +171,13 @@ pub fn log(message: &str) {
 
     let stamped = format!("[{}] {}", timestamp(), message);
 
-    println!("{stamped}");
+    // Errors are ignored on purpose: a closed pipe (`| head`) must not turn
+    // a diagnostic line into a panic, least of all inside the panic hook.
+    if TO_STDERR.load(Ordering::Relaxed) {
+        let _ = writeln!(std::io::stderr(), "{stamped}");
+    } else {
+        let _ = writeln!(std::io::stdout(), "{stamped}");
+    }
 
     if let Some(mutex) = LOG_FILE.get() {
         write_stamped_line(mutex, &stamped);
@@ -267,6 +356,14 @@ mod tests {
         ENABLED.store(false, Ordering::Relaxed);
 
         assert!(!log_item("disabled"));
+    }
+
+    #[test]
+    fn system_info_names_version_and_os() {
+        let lines = system_info_lines();
+        assert!(lines[0].contains(env!("CARGO_PKG_VERSION")));
+        assert!(lines[0].contains(std::env::consts::OS));
+        assert!(lines.iter().any(|l| l.starts_with("arguments:")));
     }
 
     #[test]

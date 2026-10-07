@@ -23,7 +23,7 @@ available** — this one fact shapes several decisions below.
 | `banner.rs` | The ASCII-art startup banner for `--cli`. Pure `std`, 7-bit ASCII, printed to stderr only when stderr is a terminal. |
 | `treemap.rs` | Squarified treemap layout algorithm — pure math, no UI dependency. |
 | `disk_space.rs` | Cross-platform "used space on this volume" query (`GetDiskFreeSpaceExW` / `statvfs`), one fast OS call, not a directory walk. |
-| `debug_log.rs` | `--debug` file + console logging, used everywhere including inside `mft.rs`'s top-level panic handler. |
+| `debug_log.rs` | `--debug` file + console logging (stderr in `--cli`, stdout in the GUI), system-info header, used everywhere including inside `mft.rs`'s top-level panic handler. |
 | `build.rs` | Embeds `assets/icon.ico` into the Windows `.exe` via `winresource` (Windows hosts only, fail-soft). |
 | `assets/` | `icon_base.svg` (ring + field), `icon_stripes.svg` and `dragon_head.png` (the artwork) are the sources of truth; `make_icon.py` composites them and regenerates `icon.ico`, `icon-512.png` and the raw `icon-256.rgba` / `icon-96.rgba` that `main.rs` and `app.rs` embed with `include_bytes!`. |
 | `win_integration.rs` | **Windows only.** Hand-rolled FFI: console allocation (`--debug`), console attach for `--cli`, elevation check, restart-as-admin. |
@@ -161,6 +161,26 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   Traversal is therefore breadth-first, and arena children order is arrival
   order, not DFS order — every consumer (`app.rs`, `cli.rs`) sorts children
   itself, so nothing may rely on arena order.
+- **The normal scan never reads or sums virtual filesystems.** `scanner::ScanFilter`
+  (built once per scan from `/proc/self/mountinfo`, falling back to `/proc/mounts`) skips the
+  mount points of `proc`, `sysfs`, `devtmpfs`, cgroups etc. below the scan root; they appear as
+  empty 0 B folders (`EntryKind::SkippedDir`). Real bug: `/proc/kcore` reports `st_size` = 128 TiB,
+  so scanning `/` showed 128 TiB within a second (reported on two servers and WSL). If the root
+  itself is on a virtual fs, file sizes count as 0. Sockets/FIFOs/device nodes never contribute
+  a size. `tmpfs` is deliberately *not* in the list (real data). The decision logic
+  (`parse_mount_table`, `ScanFilter::from_mounts`) is pure so it is tested everywhere; the
+  mutation "never skip" makes two tests fail. Other mounts below the root (e.g. `/mnt/c` in WSL)
+  are still descended into unless the user passes `--exclude`: `scanner::scan_excluding` adds
+  the canonicalized folders to the same `skip_dirs` map (value `EXCLUDED_TAG`), folders only --
+  checking files would cost a path allocation per file. Excludes must be canonicalized because
+  the walk's paths derive from the canonical root (on Windows that is a `\\?\` verbatim path).
+  `cli::run_entire_system` also drops roots inside an excluded folder, which is what stops a
+  `/mnt/c` double count. Excludes force the Windows normal scan (the MFT scan can't leave a
+  folder out) -- that branch is unverified, no Windows machine.
+- **`--debug` output goes to stderr in `--cli`.** `main.rs` calls `debug_log::route_to_stderr()`
+  before `init()`; stdout carries the report, and debug lines there broke `--json`. `log()` ignores
+  write errors, because a panicking `println!` on a closed pipe inside the panic hook aborts the
+  process. In debug mode `cli.rs` replaces the `\r` progress line with a log line every 2 s.
 - **Directory entries are one contiguous arena range per directory.**
   `scan()` pushes a whole `Batch` at once, sets `children` to the exact
   `first..len` range (no doubling-growth slack), and propagates the batch's

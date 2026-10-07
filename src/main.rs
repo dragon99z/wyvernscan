@@ -34,6 +34,11 @@ fn main() -> eframe::Result<()> {
     if debug_requested {
         #[cfg(windows)]
         win_integration::open_console();
+        // In console mode stdout carries the report, so debug lines go to
+        // stderr there (`--cli --json --debug > report.json` stays valid).
+        if std::env::args().any(|a| a == "--cli") {
+            debug_log::route_to_stderr();
+        }
         debug_log::init();
     }
 

@@ -14,6 +14,7 @@ tree and a squarified treemap — and delete straight from either view.
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![GUI](https://img.shields.io/badge/GUI-egui%20%2F%20eframe-8A2BE2)
 ![Modes](https://img.shields.io/badge/modes-GUI%20%2B%20headless%20CLI-success)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/dragon99z/wyvernscan)
 
 </div>
 
@@ -110,6 +111,7 @@ wyvernscan --cli <path>              # scan a folder or drive, print a text repo
 wyvernscan --cli --entire-system     # scan every detected drive, merged
 wyvernscan --cli C:\ --json          # machine-readable JSON report
 wyvernscan --cli /var/log --full     # ignore the --top / --depth limits
+wyvernscan --cli / --exclude /mnt/c  # WSL: keep the Windows drive out of the scan
 wyvernscan --cli --help              # full option list
 ```
 
@@ -117,11 +119,12 @@ wyvernscan --cli --help              # full option list
 |---|---|
 | `--entire-system` | Scan every detected local drive/volume, merged into one report |
 | `--mode <auto\|normal\|mft>` | Scan strategy (`mft` is Windows-only, needs Admin, whole-drive roots only) |
+| `--exclude <paths>` | Don't read these folders (shown as empty 0 B entries). Repeat the option, or separate several paths like `PATH` (`:` on Unix, `;` on Windows). Roots inside an excluded folder are dropped from `--entire-system`. Disables the Windows MFT fast scan |
 | `--top <N>` / `--depth <N>` | Limit entries per level (default 20) / levels deep (default 3) |
 | `--full` | Print everything |
 | `--json` | JSON instead of text |
 | `--no-banner` | Skip the ASCII-art banner (it is only printed when stderr is a terminal anyway) |
-| `--debug` | Also write `wyvernscan-debug.log` |
+| `--debug` | Log full detail to **stderr** and `wyvernscan-debug.log` (system info, scan decisions, progress every 2 s, every unreadable path, result summary). stdout stays clean, so `--json` is still valid |
 
 Progress goes to **stderr** and the report to **stdout**, so it pipes cleanly:
 `wyvernscan --cli C:\ --json > report.json`.
@@ -195,12 +198,21 @@ records together in memory. The record format is parsed directly — no NTFS lib
 ## Debugging
 
 Launch with `--debug` (with or without `--cli`) for a real console window on Windows and a
-`wyvernscan-debug.log` on every platform, with full detail — including exact panic messages —
+`wyvernscan-debug.log` on every platform (next to the executable, or in the temp directory if
+that folder isn't writable), with full detail — including exact panic messages —
 for anything the UI only reports in a short, simplified form. It also logs every item
 behind the "N errors" count — the exact path and the OS error for each folder or file
 that couldn't be read (capped at 2,000 lines per scan, so a failing drive can't flood it).
 The fast scan also logs a timing breakdown (time reading vs. waiting on the disk vs.
 parsing), which makes "why was this scan slow?" answerable from the log.
+
+With `--cli`, debug lines go to **stderr**, never stdout, so
+`wyvernscan --cli / --json --debug > report.json` still produces valid JSON. The log opens with
+system info (version, OS, WSL/container, user id, CPU count, arguments) and then records the
+scan decisions (which strategy, which virtual filesystems were skipped), a progress line every
+2 seconds, any single file over 1 TiB, and a result summary with the five largest entries and
+the chain of largest folders down to the biggest file. If the scanned total exceeds the used
+space of the volume, it says so, which pinpoints sparse/virtual files.
 
 If a scan pauses for several seconds, look for `slow read` lines in that log. They name
 the exact spot on the disk that responded slowly. That is the drive, not WyvernScan: an
@@ -251,6 +263,12 @@ On Windows, `build.rs` embeds `assets/icon.ico` into the `.exe`; if the Windows 
 compiler isn't available the build still succeeds, just without the exe icon.
 
 ## Known limitations
+
+- **Linux:** virtual filesystems (`/proc`, `/sys`, `/dev`, cgroups, ...) are never read; they show
+  as empty 0 B folders. Previously `/proc/kcore`, which claims to be 128 TiB, inflated every scan
+  of `/`. `tmpfs` is still scanned. Other mounts below the target (for example `/mnt/c` in WSL)
+  are still included; leave them out with `--exclude /mnt/c` (in `--entire-system` this also
+  removes it as a separate root, so it isn't counted twice).
 
 - The MFT fast scan only triggers on a whole drive root (`C:\`), never a subfolder.
 - The drive/volume list is captured once at startup; a drive plugged in mid-session

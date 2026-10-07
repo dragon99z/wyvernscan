@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -124,6 +125,17 @@ pub fn partial_interval_for(arena_len: usize) -> Duration {
     BASE + STEP * (arena_len / PER_STEP) as u32
 }
 
+/// What a directory entry turned out to be, as far as the consumer in
+/// `scan()` is concerned.
+enum EntryKind {
+    File,
+    /// A directory to descend into; carries its real path.
+    Dir(PathBuf),
+    /// A directory that is shown in the tree (as an empty, 0-byte folder) but
+    /// never read, because it is a mount point of a virtual filesystem.
+    SkippedDir,
+}
+
 /// One directory's worth of entries, read on a worker thread. Workers do
 /// *all* the syscalls (`read_dir` + per-entry `metadata`) so the single
 /// consumer thread in `scan()` only ever touches memory.
@@ -132,12 +144,231 @@ struct Batch {
     parent: usize,
     /// That directory's real path, handed back only for the progress line.
     path: PathBuf,
-    /// `(name, size, Some(path) if it's a directory to descend into)`.
-    /// The path is kept as a `PathBuf` (not rebuilt from the lossy `name`)
-    /// so non-UTF-8 names still resolve to the right directory.
-    entries: Vec<(Arc<str>, u64, Option<PathBuf>)>,
+    /// `(name, size, kind)`. A directory's path is kept as a `PathBuf` (not
+    /// rebuilt from the lossy `name`) so non-UTF-8 names still resolve to the
+    /// right directory.
+    entries: Vec<(Arc<str>, u64, EntryKind)>,
     errors: u64,
 }
+
+/// Filesystem types that only *look* like disk contents: the kernel
+/// synthesizes them on the fly, nothing in them occupies disk space, and some
+/// of their files report absurd sizes. The famous one is `/proc/kcore`, whose
+/// `st_size` is the whole 47-bit kernel address space (128 TiB) -- scanning `/`
+/// used to add that to the total within the first second. `tmpfs` is
+/// deliberately *not* here: it holds real (RAM-backed) data that a user may
+/// well want to see in `/tmp` or `/run`.
+const PSEUDO_FS: &[&str] = &[
+    "proc", "sysfs", "devtmpfs", "devpts", "devfs", "cgroup", "cgroup2", "debugfs", "tracefs",
+    "securityfs", "selinuxfs", "pstore", "bpf", "mqueue", "fusectl", "configfs", "binfmt_misc",
+    "hugetlbfs", "efivarfs", "rpc_pipefs", "nfsd", "autofs", "nsfs", "fuse.lxcfs",
+    "fuse.gvfsd-fuse", "fuse.portal",
+];
+
+pub fn is_pseudo_fs(fstype: &str) -> bool {
+    PSEUDO_FS.contains(&fstype)
+}
+
+/// `skip_dirs` value marking a folder skipped because of `--exclude` rather
+/// than because it is a virtual filesystem.
+const EXCLUDED_TAG: &str = "--exclude";
+
+/// One line of the kernel's mount table, reduced to what the scanner needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub mountpoint: PathBuf,
+    pub fstype: String,
+}
+
+/// Undo the kernel's escaping of mount table fields: a space is written as
+/// `\040`, a tab as `\011`, a backslash as `\134` (three octal digits).
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b))
+        {
+            let v = (bytes[i + 1] - b'0') as u32 * 64
+                + (bytes[i + 2] - b'0') as u32 * 8
+                + (bytes[i + 3] - b'0') as u32;
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parses `/proc/self/mountinfo` (preferred) or the older `/proc/mounts`
+/// format; the two are told apart per line by the ` - ` separator that only
+/// mountinfo has. Malformed lines are skipped rather than failing the scan.
+///
+/// Pure string handling, so it is compiled and unit-tested on every platform
+/// even though only Linux ever feeds it real data.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_mount_table(text: &str) -> Vec<MountEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let (mountpoint, fstype) = if let Some((left, right)) = line.split_once(" - ") {
+            // mountinfo: id parent maj:min root mountpoint opts [tags...] - fstype source opts
+            (left.split_whitespace().nth(4), right.split_whitespace().next())
+        } else {
+            // mounts: device mountpoint fstype opts dump pass
+            let mut f = line.split_whitespace();
+            let _device = f.next();
+            (f.next(), f.next())
+        };
+        if let (Some(mp), Some(fs)) = (mountpoint, fstype) {
+            out.push(MountEntry {
+                mountpoint: PathBuf::from(unescape_mount_field(mp)),
+                fstype: fs.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// What the walker must leave alone, decided once per scan from the mount
+/// table. Empty (a no-op) on every platform without a Linux-style mount table.
+#[derive(Debug, Default)]
+pub struct ScanFilter {
+    /// Folders below the scan root that are never read: mount points of
+    /// virtual filesystems (value = filesystem type, for the log) and
+    /// folders the user excluded (value = `EXCLUDED_TAG`).
+    skip_dirs: HashMap<PathBuf, String>,
+    /// True when the scan root itself lives on a virtual filesystem (the user
+    /// pointed the scanner at `/proc`): nothing there occupies disk space, so
+    /// every file counts as 0 bytes instead of whatever `st_size` claims.
+    ignore_sizes: bool,
+    /// Type of that filesystem, for the log.
+    root_fs: Option<String>,
+}
+
+impl ScanFilter {
+    /// Pure decision logic, separate from reading the real mount table so it
+    /// can be tested with a hand-written one.
+    pub fn from_mounts(root: &Path, mounts: &[MountEntry]) -> ScanFilter {
+        // The mount that actually holds `root` is the *deepest* one whose
+        // mount point is a prefix of it (`/dev/shm` is tmpfs even though `/dev`
+        // is devtmpfs). `max_by_key` keeps the last of equal candidates, and
+        // the table is in mount order, so a stacked mount's top layer wins.
+        let host = mounts
+            .iter()
+            .filter(|m| root.starts_with(&m.mountpoint))
+            .max_by_key(|m| m.mountpoint.as_os_str().len());
+        let (ignore_sizes, root_fs) = match host {
+            Some(m) if is_pseudo_fs(&m.fstype) => (true, Some(m.fstype.clone())),
+            _ => (false, None),
+        };
+
+        let skip_dirs = mounts
+            .iter()
+            .filter(|m| {
+                is_pseudo_fs(&m.fstype) && m.mountpoint != root && m.mountpoint.starts_with(root)
+            })
+            .map(|m| (m.mountpoint.clone(), m.fstype.clone()))
+            .collect();
+
+        ScanFilter { skip_dirs, ignore_sizes, root_fs }
+    }
+
+    /// Reads the real mount table. Any trouble reading it means "filter
+    /// nothing": a missed skip is merely the old behaviour, never a failure.
+    #[cfg(target_os = "linux")]
+    pub fn for_root(root: &Path) -> ScanFilter {
+        let table = std::fs::read_to_string("/proc/self/mountinfo")
+            .or_else(|_| std::fs::read_to_string("/proc/mounts"));
+        match table {
+            Ok(text) => ScanFilter::from_mounts(root, &parse_mount_table(&text)),
+            Err(err) => {
+                crate::debug_log::log(&format!(
+                    "could not read the mount table ({err}); virtual filesystems will not be skipped"
+                ));
+                ScanFilter::default()
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn for_root(_root: &Path) -> ScanFilter {
+        ScanFilter::default()
+    }
+
+    fn should_skip_dir(&self, path: &Path) -> bool {
+        !self.skip_dirs.is_empty() && self.skip_dirs.contains_key(path)
+    }
+
+    /// Adds user-chosen folders to skip (`--exclude`). Each is made absolute
+    /// and canonical -- the walk's paths come from the canonical root, so a
+    /// symlinked or relative spelling would otherwise never match. Entries
+    /// that aren't below the root (or are the root) can't take effect and are
+    /// reported rather than silently ignored.
+    pub fn add_excludes(&mut self, root: &Path, excludes: &[PathBuf]) {
+        for ex in excludes {
+            let abs = ex.canonicalize().unwrap_or_else(|_| {
+                if ex.is_absolute() {
+                    ex.clone()
+                } else {
+                    std::env::current_dir().map(|d| d.join(ex)).unwrap_or_else(|_| ex.clone())
+                }
+            });
+            if abs == root {
+                crate::debug_log::log(&format!(
+                    "--exclude {} ignored: it is the scan root itself",
+                    ex.display()
+                ));
+            } else if !abs.starts_with(root) {
+                crate::debug_log::log(&format!(
+                    "--exclude {} ignored: it is not below the scan root {}",
+                    ex.display(),
+                    root.display()
+                ));
+            } else {
+                self.skip_dirs.insert(abs, EXCLUDED_TAG.to_string());
+            }
+        }
+    }
+
+    /// The skipped folders of one kind (`excluded` = from `--exclude`, else
+    /// virtual filesystems) that aren't inside another skipped folder
+    /// (`/sys`, not also `/sys/fs/cgroup`), sorted -- for the one-line notice.
+    fn top_level_skips(&self, excluded: bool) -> Vec<&PathBuf> {
+        let mut v: Vec<&PathBuf> = self
+            .skip_dirs
+            .iter()
+            .filter(|(_, why)| (why.as_str() == EXCLUDED_TAG) == excluded)
+            .map(|(p, _)| p)
+            .filter(|p| !self.skip_dirs.keys().any(|q| q != *p && p.starts_with(q)))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// Whether a directory entry's `st_size` should be trusted as disk usage.
+/// Sockets, FIFOs and device nodes have no data on disk (a device's "size" is
+/// meaningless), so on Unix only regular files and symlinks count.
+#[inline]
+fn counts_toward_size(ft: &std::fs::FileType) -> bool {
+    #[cfg(unix)]
+    {
+        ft.is_file() || ft.is_symlink()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ft;
+        true
+    }
+}
+
+/// A single file at least this large is logged under `--debug`: no real disk
+/// file is, so it is nearly always a virtual or sparse file inflating a total.
+const HUGE_FILE_BYTES: u64 = 1 << 40; // 1 TiB
 
 /// Under `--debug`, record exactly which path failed and why — the detail
 /// behind the "N errors" count the UI shows.
@@ -147,7 +378,7 @@ fn note_error(what: &str, path: &Path, err: &std::io::Error) {
     }
 }
 
-fn read_batch(parent: usize, path: PathBuf) -> Batch {
+fn read_batch(parent: usize, path: PathBuf, filter: &ScanFilter) -> Batch {
     let mut entries = Vec::new();
     let mut errors = 0;
     match std::fs::read_dir(&path) {
@@ -177,22 +408,42 @@ fn read_batch(parent: usize, path: PathBuf) -> Batch {
                 // `file_type()` doesn't follow symlinks, so links and
                 // junctions are leaves, never descended into (no cycles).
                 if ft.is_dir() {
-                    entries.push((name, 0, Some(e.path())));
+                    let p = e.path();
+                    if filter.should_skip_dir(&p) {
+                        entries.push((name, 0, EntryKind::SkippedDir));
+                    } else {
+                        entries.push((name, 0, EntryKind::Dir(p)));
+                    }
                 } else {
-                    // Free on Windows (the size already came back with the
-                    // directory listing); a cheap `fstatat` on Unix.
-                    let size = match e.metadata() {
-                        Ok(m) => m.len(),
-                        Err(err) => {
-                            // Counted, so the error total and the debug log
-                            // always agree: a file whose size is unknown is
-                            // an error, not a silent zero.
-                            errors += 1;
-                            note_error("cannot read size, counted as 0 bytes", &e.path(), &err);
-                            0
+                    // Entries whose size can't be real disk usage skip the
+                    // stat entirely (also cheaper): everything on a virtual
+                    // filesystem, and sockets/FIFOs/device nodes.
+                    let size = if filter.ignore_sizes || !counts_toward_size(&ft) {
+                        0
+                    } else {
+                        // Free on Windows (the size already came back with the
+                        // directory listing); a cheap `fstatat` on Unix.
+                        match e.metadata() {
+                            Ok(m) => m.len(),
+                            Err(err) => {
+                                // Counted, so the error total and the debug
+                                // log always agree: a file whose size is
+                                // unknown is an error, not a silent zero.
+                                errors += 1;
+                                note_error("cannot read size, counted as 0 bytes", &e.path(), &err);
+                                0
+                            }
                         }
                     };
-                    entries.push((name, size, None));
+                    if size >= HUGE_FILE_BYTES && crate::debug_log::is_enabled() {
+                        crate::debug_log::log(&format!(
+                            "very large file ({} bytes, {}): {} -- sparse or virtual? it is counted in the total",
+                            size,
+                            humansize::format_size(size, humansize::BINARY),
+                            e.path().display()
+                        ));
+                    }
+                    entries.push((name, size, EntryKind::File));
                 }
             }
         }
@@ -219,6 +470,33 @@ pub fn scan(
     tx: &crossbeam_channel::Sender<ScanMessage>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
+    scan_excluding(root, threads, tx, cancel, &[])
+}
+
+/// `scan()` that also leaves out the given folders (`--exclude`): they appear
+/// in the tree as empty 0 B folders and are never read. Folders that aren't
+/// below `root` are ignored (and noted under `--debug`).
+pub fn scan_excluding(
+    root: &Path,
+    threads: usize,
+    tx: &crossbeam_channel::Sender<ScanMessage>,
+    cancel: &std::sync::atomic::AtomicBool,
+    excludes: &[PathBuf],
+) -> anyhow::Result<()> {
+    scan_with_filter(root, threads, tx, cancel, excludes, None)
+}
+
+/// `scan()` with the filter injectable, so tests can exercise virtual-
+/// filesystem skipping without needing a real `/proc` layout. `None` builds
+/// the filter from the real mount table.
+fn scan_with_filter(
+    root: &Path,
+    threads: usize,
+    tx: &crossbeam_channel::Sender<ScanMessage>,
+    cancel: &std::sync::atomic::AtomicBool,
+    excludes: &[PathBuf],
+    filter_override: Option<ScanFilter>,
+) -> anyhow::Result<()> {
     use crossbeam_channel::RecvTimeoutError;
     use std::sync::atomic::Ordering;
 
@@ -237,6 +515,46 @@ pub fn scan(
             return Ok(());
         }
     };
+
+    let mut filter = filter_override.unwrap_or_else(|| ScanFilter::for_root(&root));
+    filter.add_excludes(&root, excludes);
+    crate::debug_log::log(&format!(
+        "scan start: {} ({} worker thread(s))",
+        root.display(),
+        threads
+    ));
+    if let Some(fs) = &filter.root_fs {
+        crate::debug_log::log(&format!(
+            "scan root is on a virtual '{fs}' filesystem: file sizes there are not disk usage and count as 0"
+        ));
+        let _ = tx.send(ScanMessage::Info(format!(
+            "{} is a virtual filesystem; its files take no disk space and count as 0 B.",
+            root.display()
+        )));
+    }
+    let mut all: Vec<_> = filter.skip_dirs.iter().collect();
+    all.sort();
+    for (path, why) in all {
+        crate::debug_log::log(&if why.as_str() == EXCLUDED_TAG {
+            format!("skipping excluded folder {} (shown as an empty folder)", path.display())
+        } else {
+            format!(
+                "skipping virtual filesystem '{why}' at {} (shown as an empty folder)",
+                path.display()
+            )
+        });
+    }
+    for (excluded, label) in [(false, "Skipping virtual filesystems"), (true, "Excluded")] {
+        let list: Vec<String> = filter
+            .top_level_skips(excluded)
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        if !list.is_empty() {
+            let _ = tx.send(ScanMessage::Info(format!("{label}: {}", list.join(", "))));
+        }
+    }
+    let filter = &filter;
 
     let root_name: Arc<str> = Arc::from(
         &*root
@@ -283,7 +601,7 @@ pub fn scan(
             let res_tx = res_tx.clone();
             scope.spawn(move || {
                 for (parent, path) in job_rx {
-                    if res_tx.send(read_batch(parent, path)).is_err() {
+                    if res_tx.send(read_batch(parent, path, filter)).is_err() {
                         break; // consumer is gone (cancelled)
                     }
                 }
@@ -309,23 +627,27 @@ pub fn scan(
             // sizes propagate once per directory, not once per file.
             let first = arena.len();
             let mut total = 0u64;
-            for (name, size, dir_path) in batch.entries {
+            for (name, size, kind) in batch.entries {
                 let idx = arena.len();
                 arena.push(Node {
                     name,
-                    is_dir: dir_path.is_some(),
+                    is_dir: !matches!(kind, EntryKind::File),
                     size,
                     parent: Some(batch.parent),
                     children: Vec::new(),
                     abs_path: None,
                 });
-                if let Some(p) = dir_path {
-                    dir_count += 1;
-                    pending += 1;
-                    let _ = job_tx.send((idx, p));
-                } else {
-                    file_count += 1;
-                    total += size;
+                match kind {
+                    EntryKind::Dir(p) => {
+                        dir_count += 1;
+                        pending += 1;
+                        let _ = job_tx.send((idx, p));
+                    }
+                    EntryKind::SkippedDir => dir_count += 1,
+                    EntryKind::File => {
+                        file_count += 1;
+                        total += size;
+                    }
                 }
             }
             bytes_seen += total;
@@ -807,6 +1129,195 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn peak_rss_human() -> String {
         "unknown (peak RSS reporting only implemented for Linux)".to_string()
+    }
+
+    fn me(mp: &str, fs: &str) -> MountEntry {
+        MountEntry { mountpoint: PathBuf::from(mp), fstype: fs.to_string() }
+    }
+
+    /// A trimmed-down real `/proc/self/mountinfo`, including an escaped space
+    /// and a stacked mount (`/dev/pts` twice).
+    const MOUNTINFO: &str = "\
+23 28 0:22 / /proc rw,relatime - proc proc rw
+24 28 0:23 / /sys rw,relatime - sysfs sysfs rw
+25 28 0:6 / /dev rw,relatime - devtmpfs devtmpfs rw,size=2037336k
+26 25 0:24 / /dev/shm rw,relatime - tmpfs tmpfs rw
+27 25 0:25 / /dev/pts rw,relatime - devpts devpts rw
+28 1 254:0 / / rw,relatime - ext4 /dev/vda rw
+33 27 0:27 / /dev/pts rw,relatime - devpts devpts rw
+35 24 0:29 / /sys/fs/cgroup rw,relatime - tmpfs tmpfs rw
+36 35 0:30 / /sys/fs/cgroup/cpu rw,relatime shared:5 - cgroup cgroup rw,cpu
+47 28 0:41 / /mnt/my\\040disk rw,relatime - ext4 /dev/sdb1 rw
+garbage line
+";
+
+    #[test]
+    fn mount_table_parsing_handles_mountinfo_mounts_and_escapes() {
+        let m = parse_mount_table(MOUNTINFO);
+        assert_eq!(m.len(), 10); // the garbage line is skipped
+        assert!(m.contains(&me("/proc", "proc")));
+        assert!(m.contains(&me("/sys/fs/cgroup/cpu", "cgroup"))); // optional "shared:5" tag
+        assert!(m.contains(&me("/mnt/my disk", "ext4"))); // \040 -> space
+
+        // The older /proc/mounts layout is understood too.
+        let old = parse_mount_table("proc /proc proc rw,nosuid 0 0\n/dev/sda1 / ext4 rw 0 0\n");
+        assert_eq!(old, vec![me("/proc", "proc"), me("/", "ext4")]);
+    }
+
+    #[test]
+    fn filter_skips_virtual_mounts_below_the_root_only() {
+        let mounts = parse_mount_table(MOUNTINFO);
+
+        let f = ScanFilter::from_mounts(Path::new("/"), &mounts);
+        assert!(!f.ignore_sizes);
+        for p in ["/proc", "/sys", "/dev", "/dev/pts", "/sys/fs/cgroup/cpu"] {
+            assert!(f.should_skip_dir(Path::new(p)), "{p} should be skipped");
+        }
+        // tmpfs holds real data and is never skipped, "/" itself neither.
+        assert!(!f.should_skip_dir(Path::new("/dev/shm")));
+        assert!(!f.should_skip_dir(Path::new("/")));
+        assert!(!f.should_skip_dir(Path::new("/mnt/my disk")));
+        let tops: Vec<_> = f.top_level_skips(false).iter().map(|p| p.to_str().unwrap().to_string()).collect();
+        assert_eq!(tops, ["/dev", "/proc", "/sys"]);
+
+        // A scan that doesn't contain them has nothing to skip.
+        let f = ScanFilter::from_mounts(Path::new("/home"), &mounts);
+        assert!(f.skip_dirs.is_empty() && !f.ignore_sizes);
+    }
+
+    #[test]
+    fn filter_zeroes_sizes_when_scanning_inside_a_virtual_fs() {
+        let mounts = parse_mount_table(MOUNTINFO);
+        let f = ScanFilter::from_mounts(Path::new("/proc"), &mounts);
+        assert!(f.ignore_sizes);
+        assert!(!f.should_skip_dir(Path::new("/proc"))); // the root itself is never skipped
+        // /dev/shm is tmpfs, so it is real data even though /dev is not.
+        let f = ScanFilter::from_mounts(Path::new("/dev/shm"), &mounts);
+        assert!(!f.ignore_sizes);
+        // Component-wise prefix: /procfoo is not inside /proc.
+        let f = ScanFilter::from_mounts(Path::new("/procfoo"), &mounts);
+        assert!(!f.ignore_sizes);
+    }
+
+    /// The bug itself, end to end: a "virtual" directory holding a file with a
+    /// huge size must show up as an empty folder and add nothing to the total.
+    /// (A sparse 128 TiB file stands in for /proc/kcore; where the filesystem
+    /// can't make one, 1 GiB sparse proves the same thing.)
+    #[test]
+    fn virtual_mount_is_listed_but_not_read_or_counted() {
+        let dir = std::env::temp_dir().join(format!("wyvernscan_virt_{}", std::process::id()));
+        let virt = dir.join("virt");
+        std::fs::create_dir_all(&virt).unwrap();
+        std::fs::write(dir.join("real.txt"), vec![0u8; 100]).unwrap();
+        let big = std::fs::File::create(virt.join("kcore")).unwrap();
+        if big.set_len(128u64 << 40).is_err() {
+            big.set_len(1 << 30).unwrap();
+        }
+
+        let canon = dir.canonicalize().unwrap();
+        let filter = ScanFilter::from_mounts(
+            &canon,
+            &[me(canon.join("virt").to_str().unwrap(), "proc")],
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        scan_with_filter(&dir, 2, &tx, &cancel, &[], Some(filter)).unwrap();
+
+        let mut result = None;
+        let mut info = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ScanMessage::Done(r) => result = Some(*r),
+                ScanMessage::Info(s) => info.push(s),
+                _ => {}
+            }
+        }
+        let r = result.expect("scan should finish");
+        assert_eq!(r.arena[r.root].size, 100);
+        assert_eq!(r.file_count, 1);
+        assert_eq!(r.dir_count, 2); // root + the skipped folder
+        let v = r.arena[r.root].children.iter().copied().find(|&i| &*r.arena[i].name == "virt").unwrap();
+        assert!(r.arena[v].is_dir && r.arena[v].size == 0 && r.arena[v].children.is_empty());
+        assert!(info.iter().any(|s| s.contains("virtual filesystems")));
+
+        // Without the filter the same tree is dominated by the huge file.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        scan_with_filter(&dir, 2, &tx, &cancel, &[], Some(ScanFilter::default())).unwrap();
+        let unfiltered = rx.try_iter().find_map(|m| if let ScanMessage::Done(r) = m { Some(*r) } else { None }).unwrap();
+        assert!(unfiltered.arena[unfiltered.root].size >= (1 << 30));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--exclude`: the folder is listed but empty and uncounted, whether it
+    /// is given absolute, relative, or through a symlink; excludes outside the
+    /// root or equal to it are ignored instead of breaking the scan.
+    #[test]
+    fn excluded_folders_are_skipped_and_bad_excludes_ignored() {
+        let dir = std::env::temp_dir().join(format!("wyvernscan_excl_{}", std::process::id()));
+        let c = dir.join("mnt").join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::create_dir_all(dir.join("keep")).unwrap();
+        std::fs::write(c.join("huge.bin"), vec![0u8; 5000]).unwrap();
+        std::fs::write(dir.join("keep").join("a.txt"), vec![0u8; 70]).unwrap();
+        let other = std::env::temp_dir().join(format!("wyvernscan_excl_other_{}", std::process::id()));
+        std::fs::create_dir_all(&other).unwrap();
+
+        let run = |ex: &[PathBuf]| {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            scan_excluding(&dir, 2, &tx, &cancel, ex).unwrap();
+            let mut done = None;
+            let mut info = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    ScanMessage::Done(r) => done = Some(*r),
+                    ScanMessage::Info(s) => info.push(s),
+                    _ => {}
+                }
+            }
+            (done.unwrap(), info)
+        };
+
+        let (r, info) = run(&[c.clone()]);
+        assert_eq!(r.arena[r.root].size, 70);
+        assert_eq!(r.file_count, 1);
+        assert!(info.iter().any(|s| s.starts_with("Excluded:") && s.contains("c")));
+        let mnt = r.arena[r.root].children.iter().copied().find(|&i| &*r.arena[i].name == "mnt").unwrap();
+        let cn = r.arena[mnt].children[0];
+        assert!(r.arena[cn].is_dir && r.arena[cn].children.is_empty() && r.arena[cn].size == 0);
+
+        // A symlinked spelling and a parent-relative spelling hit the same folder.
+        let link = std::env::temp_dir().join(format!("wyvernscan_excl_link_{}", std::process::id()));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&c, &link).unwrap();
+            assert_eq!(run(&[link.clone()]).0.arena[0].size, 70);
+            std::fs::remove_file(&link).unwrap();
+        }
+        let dotted = dir.join("keep").join("..").join("mnt").join("c");
+        assert_eq!(run(&[dotted]).0.arena[0].size, 70);
+
+        // Outside the root, the root itself, and a missing path: all harmless.
+        assert_eq!(run(&[other.clone(), dir.clone(), dir.join("nope")]).0.arena[0].size, 5070);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    /// Scanning a virtual filesystem directly reports 0 B, not whatever
+    /// `st_size` claims (kcore). Uses the real /proc, so Linux only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scanning_real_proc_counts_zero_bytes() {
+        if !Path::new("/proc/self/mountinfo").exists() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        scan(Path::new("/proc"), 2, &tx, &cancel).unwrap();
+        let r = rx.try_iter().find_map(|m| if let ScanMessage::Done(r) = m { Some(*r) } else { None }).unwrap();
+        assert_eq!(r.arena[r.root].size, 0);
     }
 
     /// Checks the reindexing math in `merge_roots`: two independent
