@@ -6,7 +6,7 @@
 //! on a bad argument or a scan that failed outright) for use in scripts
 //! and cron jobs.
 
-use crate::scanner::{self, merge_roots, Node, RootEntry, ScanMessage, ScanResult};
+use crate::scanner::{self, merge_roots, Node, ScanMessage, ScanResult};
 use humansize::{format_size, BINARY};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -286,18 +286,10 @@ fn run_entire_system(
     // A root the user excluded (or that lies inside an excluded folder) is
     // not scanned at all, so `--exclude /mnt/c` also removes /mnt/c as its own
     // root -- not only from the walk of `/`.
-    let abs = |p: &PathBuf| p.canonicalize().unwrap_or_else(|_| p.clone());
-    let excluded: Vec<PathBuf> = excludes.iter().map(abs).collect();
-    let roots: Vec<RootEntry> = scanner::list_local_roots()
-        .into_iter()
-        .filter(|r| {
-            let keep = !excluded.iter().any(|e| abs(&r.path).starts_with(e));
-            if !keep {
-                crate::debug_log::log(&format!("entire system: root {} is excluded", r.path.display()));
-            }
-            keep
-        })
-        .collect();
+    let (roots, dropped) = scanner::split_excluded_roots(scanner::list_local_roots(), excludes);
+    for r in &dropped {
+        crate::debug_log::log(&format!("entire system: root {} is excluded", r.path.display()));
+    }
     if roots.is_empty() {
         eprintln!("No local drives left to scan.");
         return None;

@@ -1,5 +1,6 @@
 use crate::scanner::{
-    merge_roots, scan, list_local_roots, Node, RootEntry, ScanMessage, ScanResult,
+    exclusions_shrink_total, list_local_roots, merge_roots, scan_excluding, split_excluded_roots,
+    Node, RootEntry, ScanMessage, ScanResult,
 };
 use crate::theme;
 use eframe::egui;
@@ -70,6 +71,10 @@ impl ScanMode {
 struct Persisted {
     recent_folders: Vec<PathBuf>,
     scan_mode: ScanMode,
+    /// `default` so settings saved by an older version (without this field)
+    /// still load instead of discarding the recent folders too.
+    #[serde(default)]
+    excluded_folders: Vec<PathBuf>,
 }
 
 pub struct WyvernScanApp {
@@ -85,6 +90,11 @@ pub struct WyvernScanApp {
     recent_folders: Vec<PathBuf>,
     show_custom_path_input: bool,
     custom_path_buf: String,
+    /// Folders every scan leaves out (the GUI twin of `--exclude`). Applied
+    /// when a scan starts, so edits take effect on the next scan / Rescan.
+    excluded_folders: Vec<PathBuf>,
+    show_excludes: bool,
+    exclude_input_buf: String,
 
     scanning: bool,
     files_seen: u64,
@@ -145,6 +155,9 @@ impl Default for WyvernScanApp {
             recent_folders: Vec::new(),
             show_custom_path_input: false,
             custom_path_buf: String::new(),
+            excluded_folders: Vec::new(),
+            show_excludes: false,
+            exclude_input_buf: String::new(),
             scanning: false,
             files_seen: 0,
             bytes_seen: 0,
@@ -181,6 +194,7 @@ impl WyvernScanApp {
             if let Some(persisted) = eframe::get_value::<Persisted>(storage, eframe::APP_KEY) {
                 app.recent_folders = persisted.recent_folders;
                 app.scan_mode = persisted.scan_mode;
+                app.excluded_folders = persisted.excluded_folders;
             }
         }
         app
@@ -225,7 +239,12 @@ impl WyvernScanApp {
         // Only a whole drive/volume root gets a "of Y" total: the volume's
         // used space is a meaningful target for that, and a misleading one
         // for anything narrower (see disk_space.rs).
-        if self.available_roots.iter().any(|r| r.path == path) {
+        // ...and not when an exclusion removes part of that volume: the bar
+        // would stall short of 100%.
+        let excludes = self.excluded_folders.clone();
+        if self.available_roots.iter().any(|r| r.path == path)
+            && !exclusions_shrink_total(&[path.clone()], &[], &excludes)
+        {
             self.expected_total_bytes = crate::disk_space::disk_used_bytes(&path).map(|(used, _)| used);
         }
         let cancel = Arc::new(AtomicBool::new(false));
@@ -239,7 +258,13 @@ impl WyvernScanApp {
 
             #[cfg(windows)]
             {
-                if matches!(mode, ScanMode::Auto | ScanMode::MftFast) {
+                if !excludes.is_empty() && matches!(mode, ScanMode::Auto | ScanMode::MftFast) {
+                    // The MFT scan reads the whole volume at once and can't
+                    // leave a folder out.
+                    crate::debug_log::log(
+                        "exclusions are set: the MFT fast scan can't skip folders, using the normal scan",
+                    );
+                } else if matches!(mode, ScanMode::Auto | ScanMode::MftFast) {
                     match crate::mft::drive_letter_of_root(&path) {
                         Some(drive) => match crate::mft::scan_volume(drive, &tx, &cancel) {
                             Ok(true) => handled = true,
@@ -269,7 +294,7 @@ impl WyvernScanApp {
             let _ = mode; // only meaningful on Windows; avoid an unused-variable warning elsewhere
 
             if !handled {
-                let _ = scan(&path, threads, &tx, &cancel);
+                let _ = scan_excluding(&path, threads, &tx, &cancel, &excludes);
             }
         });
     }
@@ -287,21 +312,28 @@ impl WyvernScanApp {
         // meaningful whole-system denominator. If any single drive can't be
         // queried, skip the total entirely rather than show a denominator
         // that's silently too small.
-        let totals: Option<Vec<u64>> = self
-            .available_roots
+        //
+        // Roots inside an excluded folder are dropped entirely (so excluding
+        // /mnt/c also stops it being scanned as its own root).
+        let excludes = self.excluded_folders.clone();
+        let (roots, dropped) = split_excluded_roots(self.available_roots.clone(), &excludes);
+        let paths = |v: &[RootEntry]| v.iter().map(|r| r.path.clone()).collect::<Vec<PathBuf>>();
+        let totals: Option<Vec<u64>> = roots
             .iter()
             .map(|r| crate::disk_space::disk_used_bytes(&r.path).map(|(used, _)| used))
             .collect();
-        self.expected_total_bytes = totals.map(|v| v.iter().sum()).filter(|t| *t > 0);
+        self.expected_total_bytes = totals
+            .map(|v| v.iter().sum())
+            .filter(|t| *t > 0)
+            .filter(|_| !exclusions_shrink_total(&paths(&roots), &paths(&dropped), &excludes));
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         let threads = num_cpus::get();
         let mode = self.scan_mode;
-        let roots = self.available_roots.clone();
 
         std::thread::spawn(move || {
             if roots.is_empty() {
-                let _ = tx.send(ScanMessage::Failed("No local drives were detected.".to_string()));
+                let _ = tx.send(ScanMessage::Failed("No local drives left to scan.".to_string()));
                 return;
             }
 
@@ -318,12 +350,13 @@ impl WyvernScanApp {
                 let (sub_tx, sub_rx) = crossbeam_channel::unbounded();
                 let root_path = root.path.clone();
                 let sub_cancel = cancel.clone();
+                let sub_excludes = excludes.clone();
                 let handle = std::thread::spawn(move || {
                     #[allow(unused_mut)]
                     let mut handled = false;
                     #[cfg(windows)]
                     {
-                        if matches!(mode, ScanMode::Auto | ScanMode::MftFast) {
+                        if sub_excludes.is_empty() && matches!(mode, ScanMode::Auto | ScanMode::MftFast) {
                             if let Some(drive) = crate::mft::drive_letter_of_root(&root_path) {
                                 match crate::mft::scan_volume(drive, &sub_tx, &sub_cancel) {
                                     Ok(true) => handled = true,
@@ -342,7 +375,7 @@ impl WyvernScanApp {
                     let _ = mode;
 
                     if !handled {
-                        let _ = scan(&root_path, threads, &sub_tx, &sub_cancel);
+                        let _ = scan_excluding(&root_path, threads, &sub_tx, &sub_cancel, &sub_excludes);
                     }
                 });
 
@@ -523,6 +556,7 @@ impl eframe::App for WyvernScanApp {
         let persisted = Persisted {
             recent_folders: self.recent_folders.clone(),
             scan_mode: self.scan_mode,
+            excluded_folders: self.excluded_folders.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &persisted);
     }
@@ -571,6 +605,19 @@ impl eframe::App for WyvernScanApp {
                     }
                 }
 
+                let exclude_label = if self.excluded_folders.is_empty() {
+                    "Exclude…".to_string()
+                } else {
+                    format!("Excluded ({})", self.excluded_folders.len())
+                };
+                if ui
+                    .selectable_label(self.show_excludes, exclude_label)
+                    .on_hover_text("Folders to leave out of every scan")
+                    .clicked()
+                {
+                    self.show_excludes = !self.show_excludes;
+                }
+
                 ui.separator();
                 ui.selectable_value(&mut self.view_mode, ViewMode::Treemap, "Treemap");
                 ui.selectable_value(&mut self.view_mode, ViewMode::List, "List");
@@ -616,6 +663,10 @@ impl eframe::App for WyvernScanApp {
                         }
                     }
                 });
+            }
+
+            if self.show_excludes {
+                self.draw_excludes_panel(ui);
             }
 
             if let Some(msg) = &self.status_message {
@@ -730,6 +781,74 @@ impl eframe::App for WyvernScanApp {
 }
 
 impl WyvernScanApp {
+    /// Adds a folder to the exclusion list. Takes effect on the next scan,
+    /// which the status line says, since the current tree still contains it.
+    fn add_exclude(&mut self, path: PathBuf) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if !path.exists() {
+            self.status_message = Some(format!("Path not found: {}", path.display()));
+            return;
+        }
+        if self.excluded_folders.contains(&path) {
+            self.status_message = Some(format!("Already excluded: {}", path.display()));
+            return;
+        }
+        self.status_message = Some(format!(
+            "Excluded {} — press Rescan to apply.",
+            path.display()
+        ));
+        self.excluded_folders.push(path);
+    }
+
+    /// The editable list of excluded folders (shown under the toolbar).
+    fn draw_excludes_panel(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Excluded folders — left out of every scan; changes apply on the next scan or Rescan")
+                .color(theme::colors::MUTED)
+                .small(),
+        );
+        let mut remove: Option<usize> = None;
+        for (i, p) in self.excluded_folders.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.small_button("Remove").on_hover_text("Stop excluding this folder").clicked() {
+                    remove = Some(i);
+                }
+                ui.label(p.display().to_string());
+            });
+        }
+        if let Some(i) = remove {
+            self.excluded_folders.remove(i);
+            self.status_message = Some("Exclusion removed — press Rescan to apply.".to_string());
+        }
+
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.exclude_input_buf)
+                    .hint_text("Folder to exclude, e.g. /mnt/c")
+                    .desired_width(260.0),
+            );
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Add").clicked() || enter {
+                let candidate = PathBuf::from(self.exclude_input_buf.trim());
+                self.add_exclude(candidate);
+                if self.status_message.as_deref().map_or(false, |m| m.starts_with("Excluded")) {
+                    self.exclude_input_buf.clear();
+                }
+            }
+            if ui.button("Browse…").clicked() {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.add_exclude(folder);
+                }
+            }
+            if !self.excluded_folders.is_empty() && ui.button("Clear all").clicked() {
+                self.excluded_folders.clear();
+                self.status_message = Some("Exclusions cleared — press Rescan to apply.".to_string());
+            }
+        });
+    }
+
     fn draw_root_picker(&mut self, ui: &mut Ui) {
         let current_label = self
             .root_path
@@ -742,7 +861,7 @@ impl WyvernScanApp {
         let mut pick: Option<PathBuf> = None;
 
         egui::ComboBox::from_id_source("root_picker")
-            .width(240.0)
+            .width(200.0)
             .selected_text(current_label)
             .show_ui(ui, |ui| {
                 if ui.selectable_label(false, "Browse…").clicked() {
@@ -925,6 +1044,7 @@ impl WyvernScanApp {
         let mut toggle: Option<usize> = None;
         let mut navigate_to: Option<usize> = None;
         let mut delete: Option<usize> = None;
+        let mut exclude: Option<usize> = None;
         let scanning = self.scanning;
 
         egui_extras::TableBuilder::new(ui)
@@ -932,7 +1052,7 @@ impl WyvernScanApp {
             .column(egui_extras::Column::remainder().at_least(260.0).clip(true))
             .column(egui_extras::Column::auto().at_least(90.0))
             .column(egui_extras::Column::auto().at_least(150.0))
-            .column(egui_extras::Column::auto().at_least(36.0))
+            .column(egui_extras::Column::exact(140.0))
             .header(24.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("Name");
@@ -1026,16 +1146,28 @@ impl WyvernScanApp {
                         );
                     });
                     row.col(|ui| {
-                        if depth > 0
-                            && ui
-                                .add_enabled(
-                                    !scanning,
-                                    egui::Button::new(RichText::new("✕").color(theme::colors::DANGER)).small(),
-                                )
-                                .clicked()
-                        {
-                            delete = Some(idx);
-                        }
+                        ui.horizontal(|ui| {
+                            if depth > 0
+                                && is_dir
+                                && ui
+                                    .add(egui::Button::new(RichText::new("Exclude").color(theme::colors::ACCENT)).small())
+                                    .on_hover_text("Exclude this folder from future scans")
+                                    .clicked()
+                            {
+                                exclude = Some(idx);
+                            }
+                            if depth > 0
+                                && ui
+                                    .add_enabled(
+                                        !scanning,
+                                        egui::Button::new(RichText::new("✕").color(theme::colors::DANGER)).small(),
+                                    )
+                                    .on_hover_text("Delete")
+                                    .clicked()
+                            {
+                                delete = Some(idx);
+                            }
+                        });
                     });
                 });
             });
@@ -1056,6 +1188,10 @@ impl WyvernScanApp {
         }
         if let Some(idx) = delete {
             self.pending_delete = Some(idx);
+        }
+        if let Some(idx) = exclude {
+            let p = self.path_of(idx);
+            self.add_exclude(p);
         }
     }
 
@@ -1405,4 +1541,44 @@ fn paint_ellipsized(
     job.wrap.break_anywhere = true;
     let galley = painter.layout_job(job);
     painter.galley(pos, galley, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusions_are_added_once_and_only_if_the_folder_exists() {
+        let dir = std::env::temp_dir().join(format!("wyvernscan_gui_excl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = WyvernScanApp::default();
+
+        app.add_exclude(dir.clone());
+        assert_eq!(app.excluded_folders, vec![dir.clone()]);
+        assert!(app.status_message.as_deref().unwrap().starts_with("Excluded"));
+
+        app.add_exclude(dir.clone()); // duplicate
+        assert_eq!(app.excluded_folders.len(), 1);
+        assert!(app.status_message.as_deref().unwrap().starts_with("Already"));
+
+        app.add_exclude(dir.join("missing")); // nonexistent
+        app.add_exclude(PathBuf::new()); // blank input
+        assert_eq!(app.excluded_folders.len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Settings written by the version before exclusions existed must still
+    /// load (keeping the recent folders), not fall back to defaults.
+    #[test]
+    fn old_saved_settings_without_exclusions_still_load() {
+        let old = r#"{"recent_folders":["/home/x"],"scan_mode":"Normal"}"#;
+        let p: Persisted = serde_json::from_str(old).unwrap();
+        assert_eq!(p.recent_folders, vec![PathBuf::from("/home/x")]);
+        assert!(p.excluded_folders.is_empty());
+
+        let new = Persisted { excluded_folders: vec![PathBuf::from("/mnt/c")], ..p };
+        let back: Persisted = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.excluded_folders, vec![PathBuf::from("/mnt/c")]);
+    }
 }

@@ -1,9 +1,16 @@
 [package]
 name = "wyvernscan"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "WyvernScan - a fast disk space explorer with a live treemap, an NTFS MFT fast scan, and a headless CLI"
 build = "build.rs"
+
+[package.metadata.bundle]
+name = "WyvernScan"
+identifier = "de.dragon99z.wyvernscan"
+icon = ["assets/icon-512.png"]
+copyright = "Copyright © 2026 dragon99z"
+category = "Utility"
 
 [profile.release]
 opt-level = 3

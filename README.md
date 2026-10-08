@@ -16,6 +16,7 @@ tree and a squarified treemap — and delete straight from either view.
 ![Modes](https://img.shields.io/badge/modes-GUI%20%2B%20headless%20CLI-success)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/dragon99z/wyvernscan)
 
+
 </div>
 
 <p align="center"><img src="assets/screenshot.png" width="900" alt="WyvernScan treemap and tree view"></p>
@@ -119,7 +120,7 @@ wyvernscan --cli --help              # full option list
 |---|---|
 | `--entire-system` | Scan every detected local drive/volume, merged into one report |
 | `--mode <auto\|normal\|mft>` | Scan strategy (`mft` is Windows-only, needs Admin, whole-drive roots only) |
-| `--exclude <paths>` | Don't read these folders (shown as empty 0 B entries). Repeat the option, or separate several paths like `PATH` (`:` on Unix, `;` on Windows). Roots inside an excluded folder are dropped from `--entire-system`. Disables the Windows MFT fast scan |
+| `--exclude <paths>` | (GUI: the **Exclude…** button) Don't read these folders (shown as empty 0 B entries). Repeat the option, or separate several paths like `PATH` (`:` on Unix, `;` on Windows). Roots inside an excluded folder are dropped from `--entire-system`. Disables the Windows MFT fast scan |
 | `--top <N>` / `--depth <N>` | Limit entries per level (default 20) / levels deep (default 3) |
 | `--full` | Print everything |
 | `--json` | JSON instead of text |
@@ -194,6 +195,19 @@ records together in memory. The record format is parsed directly — no NTFS lib
   through their attribute list.
 - Anything unexpected (not NTFS, an unusual layout, an I/O error) falls back to the
   normal scan instead of guessing.
+
+## Excluding folders
+
+Folders can be left out of scans, for example WSL's `/mnt/c`, a backup disk mounted under `/`,
+or anything slow or irrelevant. Excluded folders still appear in the tree, as empty 0 B entries.
+
+- **CLI:** `--exclude <paths>` (see above).
+- **GUI:** click **Exclude…** in the toolbar to open the list. Type a folder and press Enter or
+  **Add**, use **Browse…**, or click **Exclude** on any folder row in the List view. **Remove**
+  and **Clear all** undo it. The list is remembered between runs. Changes apply to the next scan
+  or **Rescan**, because the current tree already contains the folder. With "Entire System",
+  drives inside an excluded folder are skipped entirely. On Windows, exclusions switch that scan
+  from the MFT fast scan to the normal one.
 
 ## Debugging
 

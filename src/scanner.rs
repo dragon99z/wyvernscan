@@ -165,6 +165,7 @@ const PSEUDO_FS: &[&str] = &[
     "fuse.gvfsd-fuse", "fuse.portal",
 ];
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only `for_root` (Linux) and tests call it
 pub fn is_pseudo_fs(fstype: &str) -> bool {
     PSEUDO_FS.contains(&fstype)
 }
@@ -252,6 +253,7 @@ pub struct ScanFilter {
 impl ScanFilter {
     /// Pure decision logic, separate from reading the real mount table so it
     /// can be tested with a hand-written one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only `for_root` (Linux) and tests call it
     pub fn from_mounts(root: &Path, mounts: &[MountEntry]) -> ScanFilter {
         // The mount that actually holds `root` is the *deepest* one whose
         // mount point is a prefix of it (`/dev/shm` is tmpfs even though `/dev`
@@ -451,6 +453,18 @@ fn read_batch(parent: usize, path: PathBuf, filter: &ScanFilter) -> Batch {
     Batch { parent, path, entries, errors }
 }
 
+/// Plain scan without exclusions; the app and CLI always go through
+/// `scan_excluding`, so outside tests this is only a convenience.
+#[cfg(test)]
+pub fn scan(
+    root: &Path,
+    threads: usize,
+    tx: &crossbeam_channel::Sender<ScanMessage>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<()> {
+    scan_excluding(root, threads, tx, cancel, &[])
+}
+
 /// Walk `root` with `threads` workers, each reading whole directories and
 /// sending them back as a `Batch`; this thread builds the arena from them.
 ///
@@ -464,18 +478,10 @@ fn read_batch(parent: usize, path: PathBuf, filter: &ScanFilter) -> Batch {
 ///
 /// `cancel` is checked between batches; setting it stops the walk early and
 /// still sends whatever was found as a normal `Done`, rather than nothing.
-pub fn scan(
-    root: &Path,
-    threads: usize,
-    tx: &crossbeam_channel::Sender<ScanMessage>,
-    cancel: &std::sync::atomic::AtomicBool,
-) -> anyhow::Result<()> {
-    scan_excluding(root, threads, tx, cancel, &[])
-}
-
-/// `scan()` that also leaves out the given folders (`--exclude`): they appear
-/// in the tree as empty 0 B folders and are never read. Folders that aren't
-/// below `root` are ignored (and noted under `--debug`).
+///
+/// `excludes` (`--exclude` / the GUI's exclusion list) are folders to leave
+/// out: they appear in the tree as empty 0 B folders and are never read.
+/// Folders that aren't below `root` are ignored (and noted under `--debug`).
 pub fn scan_excluding(
     root: &Path,
     threads: usize,
@@ -814,6 +820,34 @@ pub fn list_local_roots() -> Vec<RootEntry> {
     }
 
     out
+}
+
+/// Splits `roots` into (kept, dropped): a root at or inside an excluded
+/// folder is dropped, so excluding `/mnt/c` also removes `/mnt/c` as its own
+/// "Entire System" root instead of only hiding it from the walk of `/`.
+/// Shared by the CLI and the GUI so both behave the same.
+pub fn split_excluded_roots(
+    roots: Vec<RootEntry>,
+    excludes: &[PathBuf],
+) -> (Vec<RootEntry>, Vec<RootEntry>) {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let ex: Vec<PathBuf> = excludes.iter().map(|p| canon(p)).collect();
+    roots.into_iter().partition(|r| {
+        let rp = canon(&r.path);
+        !ex.iter().any(|e| rp.starts_with(e))
+    })
+}
+
+/// Whether any exclusion removes content from the volumes of the kept roots,
+/// which makes a volume's "used space" a wrong target for a progress bar (it
+/// would end well short of 100%). Excluding a folder that is itself a dropped
+/// root (`/mnt/c`) doesn't count: that volume was never part of the total.
+pub fn exclusions_shrink_total(kept: &[PathBuf], dropped: &[PathBuf], excludes: &[PathBuf]) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    excludes.iter().map(|e| canon(e)).any(|e| {
+        kept.iter().any(|r| e.starts_with(canon(r)))
+            && !dropped.iter().any(|d| e.starts_with(canon(d)))
+    })
 }
 
 /// Combine several already-scanned trees into one, under a synthetic root
@@ -1288,9 +1322,9 @@ garbage line
         assert!(r.arena[cn].is_dir && r.arena[cn].children.is_empty() && r.arena[cn].size == 0);
 
         // A symlinked spelling and a parent-relative spelling hit the same folder.
-        let link = std::env::temp_dir().join(format!("wyvernscan_excl_link_{}", std::process::id()));
         #[cfg(unix)]
         {
+            let link = std::env::temp_dir().join(format!("wyvernscan_excl_link_{}", std::process::id()));
             std::os::unix::fs::symlink(&c, &link).unwrap();
             assert_eq!(run(&[link.clone()]).0.arena[0].size, 70);
             std::fs::remove_file(&link).unwrap();
@@ -1318,6 +1352,42 @@ garbage line
         scan(Path::new("/proc"), 2, &tx, &cancel).unwrap();
         let r = rx.try_iter().find_map(|m| if let ScanMessage::Done(r) = m { Some(*r) } else { None }).unwrap();
         assert_eq!(r.arena[r.root].size, 0);
+    }
+
+    /// Uses real directories: both functions canonicalize their inputs, and
+    /// canonicalizing made-up paths behaves differently per platform (on
+    /// Windows `/` resolves to the current drive's root but a missing `/home`
+    /// stays as typed, so they would no longer be prefix-related).
+    #[test]
+    fn excluded_roots_are_dropped_and_progress_totals_stay_honest() {
+        let base = std::env::temp_dir().join(format!("wyvernscan_roots_{}", std::process::id()));
+        let c = base.join("mnt").join("c");
+        let d = base.join("mnt").join("d");
+        let cc = base.join("mnt").join("cc");
+        for dir in [&c, &d, &cc, &base.join("home")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root = |p: &Path| RootEntry {
+            label: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            path: p.to_path_buf(),
+            kind: RootKind::Volume,
+        };
+        let roots = vec![root(&base), root(&c), root(&d), root(&cc)];
+        let ex = vec![c.clone()];
+        let (kept, dropped) = split_excluded_roots(roots, &ex);
+        let names = |v: &[RootEntry]| v.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&kept), [base.clone(), d.clone(), cc.clone()]); // "cc" is not inside "c"
+        assert_eq!(names(&dropped), [c.clone()]);
+
+        // Excluding a volume that is dropped as a root doesn't shrink what the
+        // base volume should total...
+        assert!(!exclusions_shrink_total(&[base.clone()], &[c.clone()], &ex));
+        // ...but excluding an ordinary folder inside a kept root does,
+        assert!(exclusions_shrink_total(&[base.clone()], &[], &[base.join("home")]));
+        // and one outside every kept root doesn't.
+        assert!(!exclusions_shrink_total(&[base.join("home")], &[], &[d.clone()]));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// Checks the reindexing math in `merge_roots`: two independent

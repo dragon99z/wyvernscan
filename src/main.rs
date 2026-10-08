@@ -74,7 +74,7 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(&title)
             .with_icon(window_icon())
-            .with_inner_size([1050.0, 700.0])
+            .with_inner_size([1120.0, 700.0])
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };

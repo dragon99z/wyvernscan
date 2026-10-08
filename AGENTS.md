@@ -174,9 +174,17 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   the canonicalized folders to the same `skip_dirs` map (value `EXCLUDED_TAG`), folders only --
   checking files would cost a path allocation per file. Excludes must be canonicalized because
   the walk's paths derive from the canonical root (on Windows that is a `\\?\` verbatim path).
-  `cli::run_entire_system` also drops roots inside an excluded folder, which is what stops a
+  `scanner::split_excluded_roots` (used by `cli::run_entire_system` and the GUI's `start_scan_entire_system`) drops roots inside an excluded folder, which is what stops a
   `/mnt/c` double count. Excludes force the Windows normal scan (the MFT scan can't leave a
   folder out) -- that branch is unverified, no Windows machine.
+- **GUI exclusions** live in `WyvernScanApp::excluded_folders`, persisted in `Persisted`
+  (`#[serde(default)]` so settings saved before this field existed still load), snapshotted when a
+  scan starts and passed to `scanner::scan_excluding`. They are edited in the toolbar panel
+  (`draw_excludes_panel`) and via the per-row **Exclude** button in the list view. The progress
+  bar's "of Y" total is dropped when an exclusion removes content from a scanned volume
+  (`exclusions_shrink_total`). The default glyph font has no `✕`/`⊘` (they render as boxes), so new
+  buttons use text labels; the pre-existing delete button's `✕` still shows as a box. The list
+  table's last column is `Column::exact`: `auto` sized it after the name column and clipped it.
 - **`--debug` output goes to stderr in `--cli`.** `main.rs` calls `debug_log::route_to_stderr()`
   before `init()`; stdout carries the report, and debug lines there broke `--json`. `log()` ignores
   write errors, because a panicking `println!` on a closed pipe inside the panic hook aborts the
