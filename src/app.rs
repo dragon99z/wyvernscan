@@ -75,6 +75,13 @@ struct Persisted {
     /// still load instead of discarding the recent folders too.
     #[serde(default)]
     excluded_folders: Vec<PathBuf>,
+    /// Defaults to on, including for settings saved before this field existed.
+    #[serde(default = "yes")]
+    auto_update: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub struct WyvernScanApp {
@@ -139,6 +146,9 @@ pub struct WyvernScanApp {
     /// The brand logo, uploaded once at startup. `None` only in `Default`
     /// (tests, headless construction) where there is no egui context.
     logo: Option<egui::TextureHandle>,
+    /// Check GitHub for a newer release at startup and install it.
+    auto_update: bool,
+    update_rx: Option<crossbeam_channel::Receiver<String>>,
 }
 
 impl Default for WyvernScanApp {
@@ -178,6 +188,8 @@ impl Default for WyvernScanApp {
             status_message: None,
             elevated: false,
             logo: None,
+            auto_update: true,
+            update_rx: None,
         }
     }
 }
@@ -195,7 +207,24 @@ impl WyvernScanApp {
                 app.recent_folders = persisted.recent_folders;
                 app.scan_mode = persisted.scan_mode;
                 app.excluded_folders = persisted.excluded_folders;
+                app.auto_update = persisted.auto_update;
             }
+        }
+        if app.auto_update {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                match crate::updater::update() {
+                    Ok(crate::updater::Outcome::Updated(tag)) => {
+                        let _ = tx.send(format!("Updated to {tag} — restart WyvernScan to use it."));
+                    }
+                    Ok(_) => {}
+                    // Offline or no curl is normal; don't nag, just log.
+                    Err(e) => crate::debug_log::log(&format!("auto-update failed: {e:#}")),
+                }
+                ctx.request_repaint();
+            });
+            app.update_rx = Some(rx);
         }
         app
     }
@@ -557,11 +586,15 @@ impl eframe::App for WyvernScanApp {
             recent_folders: self.recent_folders.clone(),
             scan_mode: self.scan_mode,
             excluded_folders: self.excluded_folders.clone(),
+            auto_update: self.auto_update,
         };
         eframe::set_value(storage, eframe::APP_KEY, &persisted);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(msg) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.status_message = Some(msg);
+        }
         if self.scanning {
             self.poll_scan();
             ctx.request_repaint();
@@ -634,6 +667,10 @@ impl eframe::App for WyvernScanApp {
                         self.cancel_scan();
                     }
                 }
+
+                ui.separator();
+                ui.checkbox(&mut self.auto_update, "Auto-update")
+                    .on_hover_text("At startup, download the newest release from GitHub (applies on next start).");
 
                 if cfg!(windows) && !self.elevated {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -167,6 +167,9 @@ OPTIONS:
                       so --json output is still valid.
     --help            Show this message
 
+SELF-UPDATE:
+    wyvernscan --update   Download and install the newest GitHub release (needs curl)
+
 EXIT CODES:
     0   scan completed (even if some files/folders were unreadable)
     1   scan failed outright (bad path, nothing readable, etc.)

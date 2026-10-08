@@ -14,7 +14,7 @@ tree and a squarified treemap — and delete straight from either view.
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![GUI](https://img.shields.io/badge/GUI-egui%20%2F%20eframe-8A2BE2)
 ![Modes](https://img.shields.io/badge/modes-GUI%20%2B%20headless%20CLI-success)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/dragon99z/wyvernscan)
+[![Ask DeepWiki](https://img.shields.io/badge/docs-DeepWiki-orange)](https://deepwiki.com/dragon99z/wyvernscan)
 
 
 </div>
@@ -35,6 +35,7 @@ tree and a squarified treemap — and delete straight from either view.
 | **Headless `--cli` mode** | Text or JSON reports for servers and scripts with no display. |
 | **Admin-aware (Windows)** | Shows `(Admin)` in the title when elevated, with a one-click *Restart as Admin* otherwise. |
 | **Delete from either view** | With a confirmation prompt. |
+| **Auto-update** | At startup the GUI checks GitHub for a newer release and installs it (takes effect on the next start). Untick **Auto-update** in the toolbar to turn it off; `wyvernscan --update` does it from the command line. Needs `curl` (and `tar` on Linux/macOS). |
 
 ## Quick start
 
@@ -56,7 +57,7 @@ platform** (cross-compiling a GUI app from Windows is not practical; use WSL2, a
 **From Windows, the easy way is CI.** `.github/workflows/build.yml` builds and tests Windows, Linux and
 macOS (one universal binary for Apple Silicon and Intel) on GitHub's own runners. Push the repository
 to GitHub, open the **Actions** tab, pick the latest run and download the binaries from **Artifacts**.
-Pushing a tag such as `v0.1.0` also publishes them as a GitHub Release. macOS in particular can only
+Pushing a tag such as `v0.1.0` (it must match the `version` in `Cargo.toml`, CI checks this) also publishes them as a GitHub Release. macOS in particular can only
 be built on a Mac (Apple's SDK is not available elsewhere), which is exactly what the CI runner is.
 
 <details>
@@ -125,6 +126,7 @@ wyvernscan --cli --help              # full option list
 | `--full` | Print everything |
 | `--json` | JSON instead of text |
 | `--no-banner` | Skip the ASCII-art banner (it is only printed when stderr is a terminal anyway) |
+| `--update` | Download and install the newest GitHub release, then exit (works without `--cli`) |
 | `--debug` | Log full detail to **stderr** and `wyvernscan-debug.log` (system info, scan decisions, progress every 2 s, every unreadable path, result summary). stdout stays clean, so `--json` is still valid |
 
 Progress goes to **stderr** and the report to **stdout**, so it pipes cleanly:

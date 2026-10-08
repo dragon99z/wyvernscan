@@ -1,6 +1,6 @@
 [package]
 name = "wyvernscan"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "WyvernScan - a fast disk space explorer with a live treemap, an NTFS MFT fast scan, and a headless CLI"
 build = "build.rs"

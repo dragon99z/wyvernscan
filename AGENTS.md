@@ -26,6 +26,7 @@ available** — this one fact shapes several decisions below.
 | `debug_log.rs` | `--debug` file + console logging (stderr in `--cli`, stdout in the GUI), system-info header, used everywhere including inside `mft.rs`'s top-level panic handler. |
 | `build.rs` | Embeds `assets/icon.ico` into the Windows `.exe` via `winresource` (Windows hosts only, fail-soft). |
 | `assets/` | `icon_base.svg` (ring + field), `icon_stripes.svg` and `dragon_head.png` (the artwork) are the sources of truth; `make_icon.py` composites them and regenerates `icon.ico`, `icon-512.png` and the raw `icon-256.rgba` / `icon-96.rgba` that `main.rs` and `app.rs` embed with `include_bytes!`. |
+| `updater.rs` | Self-update from the latest GitHub release: `curl` for the API + download, `tar` to unpack, then swaps the running exe. Pure `std` + `serde_json`; used by the GUI (background thread at startup, `Persisted::auto_update`) and `wyvernscan --update`. |
 | `win_integration.rs` | **Windows only.** Hand-rolled FFI: console allocation (`--debug`), console attach for `--cli`, elevation check, restart-as-admin. |
 
 ## Building and testing here (sandbox-only workaround)
@@ -385,6 +386,14 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   for Unix `statvfs`, because hand-declaring that struct's layout correctly
   across Linux and macOS is genuinely risk-prone in a way that declaring a
   handful of `extern "system"` function signatures isn't.
+- **The updater shells out to `curl`/`tar` instead of adding an HTTP crate,** and its asset names
+  (`wyvernscan.exe`, `wyvernscan-linux-x86_64.tar.gz`, `wyvernscan-macos-universal.tar.gz`) must match
+  `.github/workflows/build.yml`. It compares the release tag to `CARGO_PKG_VERSION`, so **a tag must
+  point at a commit whose `Cargo.toml` already has that version** (CI enforces it; `v0.1.1` once
+  pointed at a `0.1.0` commit and shipped a binary whose banner said v0.1.0). Windows swaps the
+  running exe by renaming it to `.old` (deleted on the next update); Unix renames over it. It
+  verifies nothing beyond HTTPS. Verified on Linux against the real release; the Windows rename
+  path and macOS are unverified.
 - **No new dependency without real justification.** This project has
   deliberately avoided `windows`/`winapi`, `clap`, `log`/`tracing`/
   `env_logger`, `chrono`/`time`, and — after being removed — `jwalk`, `rayon`

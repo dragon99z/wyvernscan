@@ -33,6 +33,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The CLI banner and the self-updater both read the version from
+      # Cargo.toml, so a tag on a commit that wasn't bumped ships a stale version.
+      - name: Tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: test "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" = "$GITHUB_REF_NAME"
+
       - name: Test
         run: cargo test
 

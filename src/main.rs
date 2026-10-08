@@ -13,6 +13,7 @@ mod mft;
 mod scanner;
 mod theme;
 mod treemap;
+mod updater;
 #[cfg(windows)]
 mod win_integration;
 
@@ -51,9 +52,12 @@ fn main() -> eframe::Result<()> {
     // is attached. (`--debug` already opened its own console above.)
     #[cfg(windows)]
     {
-        if !debug_requested && std::env::args().any(|a| a == "--cli") {
+        if !debug_requested && std::env::args().any(|a| a == "--cli" || a == "--update") {
             win_integration::attach_console();
         }
+    }
+    if std::env::args().any(|a| a == "--update") {
+        cli::exit(updater::run_cli());
     }
     if let Some(cli_args) = cli::parse_args() {
         cli::exit(cli::run(cli_args));
