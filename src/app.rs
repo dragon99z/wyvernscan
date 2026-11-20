@@ -149,6 +149,13 @@ pub struct WyvernScanApp {
     /// Check GitHub for a newer release at startup and install it.
     auto_update: bool,
     update_rx: Option<crossbeam_channel::Receiver<String>>,
+
+    /// Search box text, the arena indices it matched (`None` = no search
+    /// active) and a parse error to show. Results are arena indices, so they
+    /// are dropped whenever the arena is replaced.
+    search_buf: String,
+    search_results: Option<Vec<usize>>,
+    search_error: Option<String>,
 }
 
 impl Default for WyvernScanApp {
@@ -190,6 +197,9 @@ impl Default for WyvernScanApp {
             logo: None,
             auto_update: true,
             update_rx: None,
+            search_buf: String::new(),
+            search_results: None,
+            search_error: None,
         }
     }
 }
@@ -243,6 +253,8 @@ impl WyvernScanApp {
     fn reset_for_new_scan(&mut self) {
         self.arena.clear();
         self.arena_gen += 1;
+        self.search_results = None;
+        self.search_error = None;
         self.root_idx = 0;
         self.current_idx = 0;
         self.expanded.clear();
@@ -491,6 +503,7 @@ impl WyvernScanApp {
     fn apply_scan_result(&mut self, result: ScanResult) {
         self.arena = result.arena;
         self.arena_gen += 1;
+        self.search_results = None;
         self.root_idx = result.root;
         self.current_idx = result.root;
         self.root_path = Some(result.root_path);
@@ -738,6 +751,12 @@ impl eframe::App for WyvernScanApp {
                 });
             });
 
+            // Only once the scan is complete: a half-built tree would give
+            // half-true results.
+            if !self.scanning {
+                egui::TopBottomPanel::top("search").show(ctx, |ui| self.draw_search_bar(ui));
+            }
+
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.add_space(2.0);
                 if self.scanning {
@@ -807,6 +826,10 @@ impl eframe::App for WyvernScanApp {
                 }
                 return;
             }
+            if self.search_results.is_some() && !self.scanning {
+                self.draw_search_results(ui);
+                return;
+            }
             match self.view_mode {
                 ViewMode::List => self.draw_list(ui),
                 ViewMode::Treemap => self.draw_treemap(ui),
@@ -818,6 +841,104 @@ impl eframe::App for WyvernScanApp {
 }
 
 impl WyvernScanApp {
+    fn run_search(&mut self) {
+        match crate::search::Query::parse(&self.search_buf) {
+            Ok(q) => {
+                self.search_results = Some(crate::search::search(&self.arena, self.root_idx, &q));
+                self.search_error = None;
+            }
+            Err(e) => {
+                self.search_results = None;
+                self.search_error = Some(e);
+            }
+        }
+    }
+
+    fn draw_search_bar(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Search").color(theme::colors::MUTED).small());
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.search_buf)
+                        .hint_text("*.log   type:jpg,png   size:>100MB   size:<1GB")
+                        .desired_width(380.0),
+                )
+                .on_hover_text(
+                    "Name: * and ? wildcards (plain text matches anywhere)\n\
+                     type:ext,ext or type:folder\n\
+                     size:>100MB  size:<1GB  size:>=1MB  size:5MB\n\
+                     Combine freely, e.g.  *.mp4 size:>1GB",
+                );
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Search").clicked() || enter) && !self.search_buf.trim().is_empty() {
+                self.run_search();
+            }
+            if (self.search_results.is_some() || !self.search_buf.is_empty()) && ui.button("Clear").clicked() {
+                self.search_buf.clear();
+                self.search_results = None;
+                self.search_error = None;
+            }
+            if let Some(e) = &self.search_error {
+                ui.colored_label(theme::colors::DANGER, e);
+            } else if let Some(r) = &self.search_results {
+                ui.label(RichText::new(format!("{} matches", r.len())).color(theme::colors::MUTED));
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Flat list of matches (biggest first). Clicking a name jumps to its
+    /// folder in the normal view.
+    fn draw_search_results(&mut self, ui: &mut Ui) {
+        let Some(results) = self.search_results.take() else { return };
+        let mut goto: Option<usize> = None;
+        egui_extras::TableBuilder::new(ui)
+            .striped(true)
+            .column(egui_extras::Column::auto().at_least(220.0).clip(true))
+            .column(egui_extras::Column::auto().at_least(90.0))
+            .column(egui_extras::Column::remainder().clip(true))
+            .header(24.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("Name");
+                });
+                h.col(|ui| {
+                    ui.strong("Size");
+                });
+                h.col(|ui| {
+                    ui.strong("Path");
+                });
+            })
+            .body(|body| {
+                body.rows(22.0, results.len(), |mut row| {
+                    let idx = results[row.index()];
+                    let node = &self.arena[idx];
+                    row.col(|ui| {
+                        let text = RichText::new(&*node.name).color(if node.is_dir {
+                            theme::colors::ACCENT
+                        } else {
+                            theme::colors::TEXT
+                        });
+                        if ui.link(text).on_hover_text("Show in folder").clicked() {
+                            goto = Some(idx);
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(format_size(node.size, BINARY)).monospace());
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(self.path_of(idx).display().to_string()).color(theme::colors::MUTED));
+                    });
+                });
+            });
+        self.search_results = Some(results);
+        if let Some(idx) = goto {
+            // A folder opens itself; a file opens the folder that holds it.
+            self.current_idx = if self.arena[idx].is_dir { idx } else { self.arena[idx].parent.unwrap_or(idx) };
+            self.search_results = None;
+        }
+    }
+
     /// Adds a folder to the exclusion list. Takes effect on the next scan,
     /// which the status line says, since the current tree still contains it.
     fn add_exclude(&mut self, path: PathBuf) {

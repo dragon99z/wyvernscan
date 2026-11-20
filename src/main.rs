@@ -11,6 +11,7 @@ mod debug_log;
 mod disk_space;
 mod mft;
 mod scanner;
+mod search;
 mod theme;
 mod treemap;
 mod updater;
