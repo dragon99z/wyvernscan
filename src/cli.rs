@@ -538,11 +538,11 @@ mod tests {
     fn sample_result() -> ScanResult {
         ScanResult {
             arena: vec![
-                Node { name: "root".into(), is_dir: true, size: 200, parent: None, children: vec![1, 2], abs_path: None },
-                Node { name: "a.txt".into(), is_dir: false, size: 50, parent: Some(0), children: vec![], abs_path: None },
-                Node { name: "sub".into(), is_dir: true, size: 150, parent: Some(0), children: vec![3, 4], abs_path: None },
-                Node { name: "b.txt".into(), is_dir: false, size: 100, parent: Some(2), children: vec![], abs_path: None },
-                Node { name: "c.txt".into(), is_dir: false, size: 50, parent: Some(2), children: vec![], abs_path: None },
+                Node { name: "root".into(), is_dir: true, size: 200, parent: None, children: vec![1, 2], abs_path: None, ..Default::default() },
+                Node { name: "a.txt".into(), is_dir: false, size: 50, parent: Some(0), children: vec![], abs_path: None, ..Default::default() },
+                Node { name: "sub".into(), is_dir: true, size: 150, parent: Some(0), children: vec![3, 4], abs_path: None, ..Default::default() },
+                Node { name: "b.txt".into(), is_dir: false, size: 100, parent: Some(2), children: vec![], abs_path: None, ..Default::default() },
+                Node { name: "c.txt".into(), is_dir: false, size: 50, parent: Some(2), children: vec![], abs_path: None, ..Default::default() },
             ],
             root: 0,
             root_path: PathBuf::from("/root"),

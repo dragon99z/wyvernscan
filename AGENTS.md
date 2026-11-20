@@ -183,8 +183,8 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   scan starts and passed to `scanner::scan_excluding`. They are edited in the toolbar panel
   (`draw_excludes_panel`) and via the per-row **Exclude** button in the list view. The progress
   bar's "of Y" total is dropped when an exclusion removes content from a scanned volume
-  (`exclusions_shrink_total`). The default glyph font has no `✕`/`⊘` (they render as boxes), so new
-  buttons use text labels; the pre-existing delete button's `✕` still shows as a box. The list
+  (`exclusions_shrink_total`). The default glyph font has no `✕`/`⊘` (they render as boxes), so buttons
+  use text labels (the delete buttons say "Delete"). The list
   table's last column is `Column::exact`: `auto` sized it after the name column and clipped it.
 - **`--debug` output goes to stderr in `--cli`.** `main.rs` calls `debug_log::route_to_stderr()`
   before `init()`; stdout carries the report, and debug lines there broke `--json`. `log()` ignores
@@ -350,7 +350,8 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   `.github/workflows/build.yml` builds Windows, Linux (on an older Ubuntu for
   glibc compatibility) and macOS (arm64 + x86_64 merged with `lipo`), runs the
   tests on each, and attaches binaries to a release on `v*` tags. It has not been
-  run yet; the first real run may need small fixes.
+  run yet; the first real run may need small fixes. The Windows and Linux arm64 jobs run on GitHub's native
+  arm64 runners (`windows-11-arm`, `ubuntu-22.04-arm`) and are unverified for the same reason.
 - **The CLI banner is ASCII, goes to stderr, and only shows on a terminal.**
   `banner.rs` output is plain 7-bit ASCII (a unit test enforces it, and that
   every line fits 79 columns) because box-drawing characters garble on legacy
@@ -387,7 +388,7 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   across Linux and macOS is genuinely risk-prone in a way that declaring a
   handful of `extern "system"` function signatures isn't.
 - **The updater shells out to `curl`/`tar` instead of adding an HTTP crate,** and its asset names
-  (`wyvernscan.exe`, `wyvernscan-linux-x86_64.tar.gz`, `wyvernscan-macos-universal.tar.gz`) must match
+  (`wyvernscan.exe`, `wyvernscan-windows-arm64.exe`, `wyvernscan-linux-x86_64.tar.gz`, `wyvernscan-linux-aarch64.tar.gz`, `wyvernscan-macos-universal.tar.gz`) must match
   `.github/workflows/build.yml`. It compares the release tag to `CARGO_PKG_VERSION`, so **a tag must
   point at a commit whose `Cargo.toml` already has that version** (CI enforces it; `v0.1.1` once
   pointed at a `0.1.0` commit and shipped a binary whose banner said v0.1.0). Windows swaps the

@@ -22,7 +22,9 @@ pub enum Outcome {
 fn asset() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Some("wyvernscan.exe"),
+        ("windows", "aarch64") => Some("wyvernscan-windows-arm64.exe"),
         ("linux", "x86_64") => Some("wyvernscan-linux-x86_64.tar.gz"),
+        ("linux", "aarch64") => Some("wyvernscan-linux-aarch64.tar.gz"),
         ("macos", _) => Some("wyvernscan-macos-universal.tar.gz"),
         _ => None,
     }

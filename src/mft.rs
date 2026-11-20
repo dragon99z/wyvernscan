@@ -266,6 +266,7 @@ const REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// Record number of the root directory in every NTFS volume.
 const ROOT_RECORD: usize = 5;
 
+const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
@@ -357,6 +358,14 @@ struct Parsed {
     /// data) may live in extension records and its sizes aren't final yet.
     has_attr_list: bool,
     names: Vec<NameRef>,
+    /// `(created, modified)` in Unix seconds from `$STANDARD_INFORMATION`
+    /// (the `$FILE_NAME` copies are only refreshed on rename/move, so they go stale).
+    times: Option<(u32, u32)>,
+}
+
+/// NTFS timestamps are 100 ns ticks since 1601-01-01; 0 (unknown) for anything before 1970.
+fn filetime_secs(ft: u64) -> u32 {
+    (ft / 10_000_000).checked_sub(11_644_473_600).map_or(0, |s| s.min(u64::from(u32::MAX)) as u32)
 }
 
 /// Parse a fixed-up record. `None` means structurally corrupt.
@@ -364,6 +373,7 @@ fn parse_record(rec: &[u8], out: &mut Parsed) -> Option<()> {
     out.names.clear();
     out.size = None;
     out.has_attr_list = false;
+    out.times = None;
     let flags = u16_at(rec, 0x16)?;
     out.is_dir = flags & 0x02 != 0;
     out.base = u64_at(rec, 0x20)?;
@@ -381,6 +391,13 @@ fn parse_record(rec: &[u8], out: &mut Parsed) -> Option<()> {
         let non_resident = *rec.get(off + 8)? != 0;
         let name_len = *rec.get(off + 9)?;
         match ty {
+            // Best effort: a malformed one only loses the dates, not the entry.
+            ATTR_STANDARD_INFORMATION if !non_resident => {
+                let voff = off + u16_at(rec, off + 20)? as usize;
+                if let Some(v) = rec.get(voff..voff.checked_add(16)?) {
+                    out.times = Some((filetime_secs(u64_at(v, 0)?), filetime_secs(u64_at(v, 8)?)));
+                }
+            }
             ATTR_FILE_NAME if !non_resident => {
                 let vlen = u32_at(rec, off + 16)? as usize;
                 let voff = off + u16_at(rec, off + 20)? as usize;
@@ -839,6 +856,8 @@ struct Tables {
     flags: Vec<u8>,
     /// Unnamed `$DATA` size per record.
     size: Vec<u64>,
+    /// `(created, modified)` per record.
+    times: Vec<(u32, u32)>,
     entries: Vec<Entry>,
     pool: String,
     errors: u64,
@@ -866,6 +885,7 @@ impl Tables {
             next_rec: 0,
             flags: vec![0; records],
             size: vec![0; records],
+            times: vec![(0, 0); records],
             entries: Vec::new(),
             pool: String::new(),
             errors: 0,
@@ -877,6 +897,7 @@ impl Tables {
                 parent: None,
                 children: Vec::new(),
                 abs_path: None,
+                ..Default::default()
             }],
             dir_node,
             waiting: vec![NONE; records],
@@ -924,6 +945,9 @@ impl Tables {
             }
             if !is_ext {
                 self.flags[num] = IN_USE | if parsed.is_dir { IS_DIR } else { 0 };
+            }
+            if let Some(t) = parsed.times {
+                self.times[owner] = t;
             }
             if let Some(sz) = parsed.size {
                 self.size[owner] = sz;
@@ -982,6 +1006,7 @@ impl Tables {
             let (rec, name_off, name_len) = (e.rec as usize, e.name_off as usize, e.name_len as usize);
             let is_dir = self.flags[rec] & IS_DIR != 0;
             let idx = self.arena.len();
+            let (created, modified) = self.times[rec];
             self.arena.push(Node {
                 name: Arc::from(&self.pool[name_off..name_off + name_len]),
                 is_dir,
@@ -989,6 +1014,8 @@ impl Tables {
                 parent: Some(parent_idx as usize),
                 children: Vec::new(),
                 abs_path: None,
+                created,
+                modified,
             });
             self.arena[parent_idx as usize].children.push(idx);
             if !is_dir {
@@ -1958,6 +1985,22 @@ mod tests {
         assert!(decode_runs(&[0x91, 1, 0]).is_none());
         // Delta that would go below cluster 0 is corrupt.
         assert!(decode_runs(&[0x11, 1, 0xFF, 0]).is_none());
+    }
+
+    #[test]
+    fn standard_information_dates_are_read_as_unix_seconds() {
+        // 2024-01-01T00:00:00Z created, one day later modified, in FILETIME ticks.
+        let ft = |unix: u64| (unix + 11_644_473_600) * 10_000_000;
+        let mut si = vec![0u8; 48];
+        p64(&mut si, 0, ft(1_704_067_200));
+        p64(&mut si, 8, ft(1_704_067_200 + 86_400));
+        let mut rec = record(FILE, 0, &[resident(ATTR_STANDARD_INFORMATION, &si), file_name(5, 1, "a.txt")]);
+        assert!(apply_fixups(&mut rec));
+        let mut parsed = Parsed::default();
+        parse_record(&rec, &mut parsed).unwrap();
+        assert_eq!(parsed.times, Some((1_704_067_200, 1_704_067_200 + 86_400)));
+        assert_eq!(parsed.names.len(), 1); // the names after it are still found
+        assert_eq!(filetime_secs(0), 0); // before 1970 = unknown
     }
 
     #[test]

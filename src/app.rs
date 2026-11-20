@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// The flattened, visible rows of the tree-style list view (node index and
 /// nesting depth), plus the inputs they were built from. Rebuilding means
@@ -17,7 +18,7 @@ use std::sync::Arc;
 /// expanded folder is too much to redo on every repaint while scrolling —
 /// so it's only redone when the key actually changes.
 struct TreeCache {
-    key: (usize, u64, usize, SortBy, u64),
+    key: (usize, u64, usize, SortBy, bool, u64),
     rows: Vec<(usize, u32)>,
 }
 
@@ -37,6 +38,23 @@ enum ViewMode {
 enum SortBy {
     Size,
     Name,
+    /// Newest modified first.
+    Date,
+}
+
+/// A search that is running or finished. `hits` fills up frame by frame while
+/// `next` walks the arena, so results show up live and the window never blocks.
+struct SearchRun {
+    query: crate::search::Query,
+    hits: Vec<usize>,
+    /// Next arena index to examine; the search is done once it reaches the end.
+    next: usize,
+    /// What `hits` is currently ordered by (sort, direction) and how many there were then.
+    sorted: Option<(SortBy, bool, usize)>,
+    last_sort: Instant,
+    started: Instant,
+    /// How long the search took, once every entry has been examined.
+    finished: Option<Duration>,
 }
 
 /// Which scanning strategy to use. The Windows-only fast path still exists
@@ -91,6 +109,9 @@ pub struct WyvernScanApp {
     current_idx: usize,
     view_mode: ViewMode,
     sort_by: SortBy,
+    /// Direction of `sort_by`. Each sort starts in its natural direction
+    /// (biggest, newest, A-Z first); clicking the active one flips it.
+    sort_asc: bool,
 
     scan_mode: ScanMode,
     available_roots: Vec<RootEntry>,
@@ -150,12 +171,13 @@ pub struct WyvernScanApp {
     auto_update: bool,
     update_rx: Option<crossbeam_channel::Receiver<String>>,
 
-    /// Search box text, the arena indices it matched (`None` = no search
-    /// active) and a parse error to show. Results are arena indices, so they
-    /// are dropped whenever the arena is replaced.
+    /// Search box text, the active search (`None` = no search) and a parse
+    /// error to show. Hits are arena indices, so the search is dropped
+    /// whenever the arena is replaced.
     search_buf: String,
-    search_results: Option<Vec<usize>>,
+    search: Option<SearchRun>,
     search_error: Option<String>,
+    search_threads: usize,
 }
 
 impl Default for WyvernScanApp {
@@ -167,6 +189,7 @@ impl Default for WyvernScanApp {
             current_idx: 0,
             view_mode: ViewMode::Treemap,
             sort_by: SortBy::Size,
+            sort_asc: false,
             scan_mode: ScanMode::default(),
             available_roots: Vec::new(),
             recent_folders: Vec::new(),
@@ -198,8 +221,9 @@ impl Default for WyvernScanApp {
             auto_update: true,
             update_rx: None,
             search_buf: String::new(),
-            search_results: None,
+            search: None,
             search_error: None,
+            search_threads: num_cpus::get(),
         }
     }
 }
@@ -253,7 +277,7 @@ impl WyvernScanApp {
     fn reset_for_new_scan(&mut self) {
         self.arena.clear();
         self.arena_gen += 1;
-        self.search_results = None;
+        self.search = None;
         self.search_error = None;
         self.root_idx = 0;
         self.current_idx = 0;
@@ -503,7 +527,7 @@ impl WyvernScanApp {
     fn apply_scan_result(&mut self, result: ScanResult) {
         self.arena = result.arena;
         self.arena_gen += 1;
-        self.search_results = None;
+        self.search = None;
         self.root_idx = result.root;
         self.current_idx = result.root;
         self.root_path = Some(result.root_path);
@@ -582,12 +606,51 @@ impl WyvernScanApp {
         v
     }
 
+    /// Orders arena indices by the toolbar's Sort choice (stable, so ties keep
+    /// their order). Shared by the list view and the search results.
+    fn sort_indices(a: &[Node], by: SortBy, asc: bool, v: &mut [usize]) {
+        v.sort_by(|&x, &y| {
+            let o = match by {
+                SortBy::Size => a[x].size.cmp(&a[y].size),
+                SortBy::Name => a[x].name.cmp(&a[y].name),
+                SortBy::Date => a[x].modified.cmp(&a[y].modified),
+            };
+            if asc { o } else { o.reverse() }
+        });
+    }
+
+    /// A Sort button; clicking the active one flips its direction, shown as an
+    /// arrow (down = biggest / newest / Z first, up = the reverse). The arrow is
+    /// painted, not a glyph: the default font lacks many arrow characters.
+    fn sort_button(&mut self, ui: &mut Ui, by: SortBy, label: &str) {
+        let active = self.sort_by == by;
+        // Trailing spaces leave room for the arrow painted over them.
+        let text = if active { format!("{label}    ") } else { label.to_string() };
+        let resp = ui.selectable_label(active, text).on_hover_text("Click again to reverse");
+        if active {
+            let color = ui.style().interact_selectable(&resp, true).fg_stroke.color;
+            let c = resp.rect.right_center() - egui::vec2(11.0, 0.0);
+            let (w, h) = (4.0, 3.0);
+            let pts = if self.sort_asc {
+                vec![c + egui::vec2(-w, h), c + egui::vec2(w, h), c + egui::vec2(0.0, -h)]
+            } else {
+                vec![c + egui::vec2(-w, -h), c + egui::vec2(w, -h), c + egui::vec2(0.0, h)]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+        }
+        if resp.clicked() {
+            if active {
+                self.sort_asc = !self.sort_asc;
+            } else {
+                self.sort_by = by;
+                self.sort_asc = by == SortBy::Name; // A-Z first; size and date start biggest / newest
+            }
+        }
+    }
+
     fn sorted_children(&self, idx: usize) -> Vec<usize> {
         let mut kids = self.arena[idx].children.clone();
-        match self.sort_by {
-            SortBy::Size => kids.sort_by(|a, b| self.arena[*b].size.cmp(&self.arena[*a].size)),
-            SortBy::Name => kids.sort_by(|a, b| self.arena[*a].name.cmp(&self.arena[*b].name)),
-        }
+        Self::sort_indices(&self.arena, self.sort_by, self.sort_asc, &mut kids);
         kids
     }
 
@@ -669,8 +732,9 @@ impl eframe::App for WyvernScanApp {
                 ui.selectable_value(&mut self.view_mode, ViewMode::List, "List");
                 ui.separator();
                 ui.label(RichText::new("Sort").color(theme::colors::MUTED).small());
-                ui.selectable_value(&mut self.sort_by, SortBy::Size, "Size");
-                ui.selectable_value(&mut self.sort_by, SortBy::Name, "Name");
+                self.sort_button(ui, SortBy::Size, "Size");
+                self.sort_button(ui, SortBy::Name, "Name");
+                self.sort_button(ui, SortBy::Date, "Date");
 
                 if self.scanning {
                     ui.separator();
@@ -719,11 +783,24 @@ impl eframe::App for WyvernScanApp {
                 self.draw_excludes_panel(ui);
             }
 
-            if let Some(msg) = &self.status_message {
-                ui.colored_label(theme::colors::ACCENT, msg);
+            // The search bar sits right of the "Using … scan" message. Only
+            // once the scan is complete: a half-built tree would give
+            // half-true results.
+            let can_search = !self.scanning && !self.arena.is_empty();
+            if self.status_message.is_some() || can_search {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(msg) = &self.status_message {
+                        ui.colored_label(theme::colors::ACCENT, msg);
+                        ui.separator();
+                    }
+                    if can_search {
+                        self.draw_search_bar(ui);
+                    }
+                });
             }
             ui.add_space(4.0);
         });
+        self.step_search(ctx);
 
         if !self.arena.is_empty() {
             egui::TopBottomPanel::top("breadcrumbs").show(ctx, |ui| {
@@ -750,12 +827,6 @@ impl eframe::App for WyvernScanApp {
                     }
                 });
             });
-
-            // Only once the scan is complete: a half-built tree would give
-            // half-true results.
-            if !self.scanning {
-                egui::TopBottomPanel::top("search").show(ctx, |ui| self.draw_search_bar(ui));
-            }
 
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.add_space(2.0);
@@ -790,6 +861,25 @@ impl eframe::App for WyvernScanApp {
                             ))
                             .color(theme::colors::MUTED),
                         );
+                    }
+                    if let Some(run) = &self.search {
+                        ui.separator();
+                        match run.finished {
+                            Some(t) => {
+                                ui.label(
+                                    RichText::new(format!("Search done in {}", crate::scanner::format_duration(t.as_secs_f64())))
+                                        .strong()
+                                        .color(theme::colors::ACCENT),
+                                );
+                                ui.label(RichText::new(format!("— {} matches", run.hits.len())).color(theme::colors::MUTED));
+                            }
+                            None => {
+                                let frac = run.next as f32 / self.arena.len().max(1) as f32;
+                                ui.spinner();
+                                ui.add(egui::ProgressBar::new(frac).desired_width(140.0).show_percentage());
+                                ui.label(RichText::new(format!("Searching… {} matches so far", run.hits.len())).color(theme::colors::MUTED));
+                            }
+                        }
                     }
                     ui.separator();
                     ui.label(
@@ -826,7 +916,7 @@ impl eframe::App for WyvernScanApp {
                 }
                 return;
             }
-            if self.search_results.is_some() && !self.scanning {
+            if self.search.is_some() && !self.scanning {
                 self.draw_search_results(ui);
                 return;
             }
@@ -843,75 +933,148 @@ impl eframe::App for WyvernScanApp {
 impl WyvernScanApp {
     fn run_search(&mut self) {
         match crate::search::Query::parse(&self.search_buf) {
-            Ok(q) => {
-                self.search_results = Some(crate::search::search(&self.arena, self.root_idx, &q));
+            Ok(query) => {
+                self.search = Some(SearchRun { query, hits: Vec::new(), next: 0, sorted: None, last_sort: Instant::now(), started: Instant::now(), finished: None });
                 self.search_error = None;
             }
             Err(e) => {
-                self.search_results = None;
+                self.search = None;
                 self.search_error = Some(e);
             }
         }
     }
 
-    fn draw_search_bar(&mut self, ui: &mut Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Search").color(theme::colors::MUTED).small());
-            let resp = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.search_buf)
-                        .hint_text("*.log   type:jpg,png   size:>100MB   size:<1GB")
-                        .desired_width(380.0),
-                )
-                .on_hover_text(
-                    "Name: * and ? wildcards (plain text matches anywhere)\n\
-                     type:ext,ext or type:folder\n\
-                     size:>100MB  size:<1GB  size:>=1MB  size:5MB\n\
-                     Combine freely, e.g.  *.mp4 size:>1GB",
-                );
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Search").clicked() || enter) && !self.search_buf.trim().is_empty() {
-                self.run_search();
-            }
-            if (self.search_results.is_some() || !self.search_buf.is_empty()) && ui.button("Clear").clicked() {
-                self.search_buf.clear();
-                self.search_results = None;
-                self.search_error = None;
-            }
-            if let Some(e) = &self.search_error {
-                ui.colored_label(theme::colors::DANGER, e);
-            } else if let Some(r) = &self.search_results {
-                ui.label(RichText::new(format!("{} matches", r.len())).color(theme::colors::MUTED));
-            }
-        });
-        ui.add_space(4.0);
+    /// Advances a running search by a few milliseconds and keeps its hits in
+    /// the toolbar's sort order. Called every frame, so the window stays
+    /// responsive and results appear while it works.
+    fn step_search(&mut self, ctx: &egui::Context) {
+        let Some(run) = self.search.as_mut() else { return };
+        let total = self.arena.len();
+        let done = if run.next < total {
+            let done = crate::search::step(&self.arena, self.root_idx, &run.query, &mut run.next, &mut run.hits, Duration::from_millis(8), self.search_threads);
+            ctx.request_repaint();
+            done
+        } else {
+            true
+        };
+        if done && run.finished.is_none() {
+            run.finished = Some(run.started.elapsed());
+        }
+        let (by, asc, n) = (self.sort_by, self.sort_asc, run.hits.len());
+        let sort_changed = run.sorted.map_or(true, |(s, d, _)| (s, d) != (by, asc));
+        let grown = run.sorted.map_or(true, |(_, _, m)| m != n);
+        // A new Sort choice applies at once; while hits are still arriving the
+        // re-sort is throttled (it grows with the hit count) so it can't eat the frame.
+        let throttle = Duration::from_millis(150 + n as u64 / 2000);
+        if sort_changed || (grown && (done || run.last_sort.elapsed() >= throttle)) {
+            Self::sort_indices(&self.arena, by, asc, &mut run.hits);
+            run.sorted = Some((by, asc, n));
+            run.last_sort = Instant::now();
+        }
     }
 
-    /// Flat list of matches (biggest first). Clicking a name jumps to its
-    /// folder in the normal view.
+    /// Puts a preset such as `size:>` into the box at the text cursor (at the
+    /// end if the box was never focused) and puts the cursor right after it.
+    fn insert_preset(&mut self, ctx: &egui::Context, id: egui::Id, preset: &str) {
+        use egui::text::{CCursor, CCursorRange};
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let chars = self.search_buf.chars().count();
+        let at = state.cursor.char_range().map_or(chars, |r| r.primary.index.min(chars));
+        let byte = self.search_buf.char_indices().nth(at).map_or(self.search_buf.len(), |(b, _)| b);
+        // Terms are space-separated, so never glue the preset onto a previous term.
+        let text = if self.search_buf[..byte].ends_with(|c: char| !c.is_whitespace()) {
+            format!(" {preset}")
+        } else {
+            preset.to_string()
+        };
+        self.search_buf.insert_str(byte, &text);
+        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(at + text.chars().count()))));
+        state.store(ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+
+    fn draw_search_bar(&mut self, ui: &mut Ui) {
+        let id = egui::Id::new("search_input");
+        ui.label(RichText::new("Search").color(theme::colors::MUTED).small());
+        let resp = ui
+            .add(
+                egui::TextEdit::singleline(&mut self.search_buf)
+                    .id(id)
+                    .hint_text("*.log   type:jpg   size:>100MB   modified:>2024-05-17")
+                    .desired_width(380.0),
+            )
+            .on_hover_text(
+                "Name: * and ? wildcards (plain text matches anywhere)\n\
+                 type:ext,ext or type:folder\n\
+                 size:>100MB  size:<1GB  size:>=1MB  size:5MB\n\
+                 modified:>2024-05-17  created:<2023-01  date:2024  (after / before / on; day, month or year)\n\
+                 Combine freely, e.g.  *.mp4 size:>1GB modified:>2024",
+            );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+        let mut picked = None;
+        egui::ComboBox::from_id_source("search_insert")
+            .selected_text("Insert…")
+            .show_ui(ui, |ui| {
+                for (label, text) in crate::search::PRESETS {
+                    if ui.selectable_label(false, *label).clicked() {
+                        picked = Some(*text);
+                    }
+                }
+            });
+        if let Some(text) = picked {
+            self.insert_preset(ui.ctx(), id, text);
+        }
+
+        if (ui.button("Search").clicked() || enter) && !self.search_buf.trim().is_empty() {
+            self.run_search();
+        }
+        if (self.search.is_some() || !self.search_buf.is_empty()) && ui.button("Clear").clicked() {
+            self.search_buf.clear();
+            self.search = None;
+            self.search_error = None;
+        }
+        if let Some(e) = &self.search_error {
+            ui.colored_label(theme::colors::DANGER, e);
+        } else if let Some(run) = &self.search {
+            ui.label(RichText::new(format!("{} matches", run.hits.len())).color(theme::colors::MUTED));
+        }
+    }
+
+    /// Flat list of matches in the toolbar's Sort order, filling in live.
+    /// Clicking a name jumps to its folder in the normal view.
     fn draw_search_results(&mut self, ui: &mut Ui) {
-        let Some(results) = self.search_results.take() else { return };
+        let Some(run) = self.search.take() else { return };
         let mut goto: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+        // Delete is the last column, and only a last `remainder` column follows
+        // the window width, so every width is fixed or computed (see draw_list).
+        const SIZE_W: f32 = 100.0;
+        const DATE_W: f32 = 90.0;
+        const DELETE_W: f32 = 70.0;
+        let free = ui.available_width()
+            - (SIZE_W + DATE_W * 2.0 + DELETE_W)
+            - ui.spacing().item_spacing.x * 5.0
+            - ui.spacing().scroll.allocated_width();
+        let name_w = (free * 0.35).max(140.0);
+        let path_w = (free - name_w).max(100.0);
         egui_extras::TableBuilder::new(ui)
             .striped(true)
-            .column(egui_extras::Column::auto().at_least(220.0).clip(true))
-            .column(egui_extras::Column::auto().at_least(90.0))
-            .column(egui_extras::Column::remainder().clip(true))
+            .column(egui_extras::Column::exact(name_w).clip(true))
+            .column(egui_extras::Column::exact(SIZE_W))
+            .column(egui_extras::Column::exact(DATE_W))
+            .column(egui_extras::Column::exact(DATE_W))
+            .column(egui_extras::Column::exact(path_w).clip(true))
+            .column(egui_extras::Column::exact(DELETE_W))
             .header(24.0, |mut h| {
-                h.col(|ui| {
-                    ui.strong("Name");
-                });
-                h.col(|ui| {
-                    ui.strong("Size");
-                });
-                h.col(|ui| {
-                    ui.strong("Path");
-                });
+                for title in ["Name", "Size", "Modified", "Created", "Path"] {
+                    h.col(|ui| header_label(ui, title));
+                }
+                h.col(|_| {});
             })
             .body(|body| {
-                body.rows(22.0, results.len(), |mut row| {
-                    let idx = results[row.index()];
+                body.rows(22.0, run.hits.len(), |mut row| {
+                    let idx = run.hits[row.index()];
                     let node = &self.arena[idx];
                     row.col(|ui| {
                         let text = RichText::new(&*node.name).color(if node.is_dir {
@@ -927,15 +1090,33 @@ impl WyvernScanApp {
                         ui.label(RichText::new(format_size(node.size, BINARY)).monospace());
                     });
                     row.col(|ui| {
+                        ui.label(RichText::new(crate::search::fmt_date(node.modified)).monospace());
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(crate::search::fmt_date(node.created)).monospace());
+                    });
+                    row.col(|ui| {
                         ui.label(RichText::new(self.path_of(idx).display().to_string()).color(theme::colors::MUTED));
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new("Delete").color(theme::colors::DANGER)).small())
+                            .on_hover_text("Permanently delete (asks first)")
+                            .clicked()
+                        {
+                            delete = Some(idx);
+                        }
                     });
                 });
             });
-        self.search_results = Some(results);
+        if let Some(idx) = delete {
+            self.pending_delete = Some(idx);
+        }
         if let Some(idx) = goto {
             // A folder opens itself; a file opens the folder that holds it.
             self.current_idx = if self.arena[idx].is_dir { idx } else { self.arena[idx].parent.unwrap_or(idx) };
-            self.search_results = None;
+        } else {
+            self.search = Some(run);
         }
     }
 
@@ -1192,6 +1373,7 @@ impl WyvernScanApp {
             self.arena_gen,
             self.current_idx,
             self.sort_by,
+            self.sort_asc,
             self.expanded_gen,
         );
         let rows = match self.tree_cache.take() {
@@ -1205,22 +1387,34 @@ impl WyvernScanApp {
         let mut exclude: Option<usize> = None;
         let scanning = self.scanning;
 
+        // Only a *last* `remainder` column follows the window width; a first one
+        // keeps whatever width it got on the table's first frame, so the list
+        // stopped filling the window after a resize. So the other columns are
+        // fixed and Name gets what they leave, recomputed every frame.
+        const SIZE_W: f32 = 100.0;
+        const MODIFIED_W: f32 = 90.0;
+        const PERCENT_W: f32 = 150.0;
+        const EXCLUDE_W: f32 = 70.0;
+        const DELETE_W: f32 = 70.0;
+        let name_w = (ui.available_width()
+            - (SIZE_W + MODIFIED_W + PERCENT_W + EXCLUDE_W + DELETE_W)
+            - ui.spacing().item_spacing.x * 6.0
+            - ui.spacing().scroll.allocated_width())
+        .max(140.0);
+
         egui_extras::TableBuilder::new(ui)
             .striped(true)
-            .column(egui_extras::Column::remainder().at_least(260.0).clip(true))
-            .column(egui_extras::Column::auto().at_least(90.0))
-            .column(egui_extras::Column::auto().at_least(150.0))
-            .column(egui_extras::Column::exact(140.0))
+            .column(egui_extras::Column::exact(name_w).clip(true))
+            .column(egui_extras::Column::exact(SIZE_W))
+            .column(egui_extras::Column::exact(MODIFIED_W))
+            .column(egui_extras::Column::exact(PERCENT_W))
+            .column(egui_extras::Column::exact(EXCLUDE_W))
+            .column(egui_extras::Column::exact(DELETE_W))
             .header(24.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("Name");
-                });
-                header.col(|ui| {
-                    ui.strong("Size");
-                });
-                header.col(|ui| {
-                    ui.strong("% of parent");
-                });
+                for title in ["Name", "Size", "Modified", "% of parent"] {
+                    header.col(|ui| header_label(ui, title));
+                }
+                header.col(|_| {});
                 header.col(|_| {});
             })
             .body(|body| {
@@ -1233,6 +1427,7 @@ impl WyvernScanApp {
                     let is_dir = node.is_dir;
                     let has_children = is_dir && !node.children.is_empty();
                     let size = node.size;
+                    let modified = node.modified;
                     let name = node.name.clone();
                     let parent_size = node
                         .parent
@@ -1283,6 +1478,9 @@ impl WyvernScanApp {
                         ui.label(RichText::new(format_size(size, BINARY)).monospace());
                     });
                     row.col(|ui| {
+                        ui.label(RichText::new(crate::search::fmt_date(modified)).monospace());
+                    });
+                    row.col(|ui| {
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width().max(60.0), 14.0),
                             egui::Sense::hover(),
@@ -1303,29 +1501,31 @@ impl WyvernScanApp {
                             theme::colors::TEXT,
                         );
                     });
+                    // Separate columns, so Delete lines up on every row even
+                    // though files have no Exclude button.
                     row.col(|ui| {
-                        ui.horizontal(|ui| {
-                            if depth > 0
-                                && is_dir
-                                && ui
-                                    .add(egui::Button::new(RichText::new("Exclude").color(theme::colors::ACCENT)).small())
-                                    .on_hover_text("Exclude this folder from future scans")
-                                    .clicked()
-                            {
-                                exclude = Some(idx);
-                            }
-                            if depth > 0
-                                && ui
-                                    .add_enabled(
-                                        !scanning,
-                                        egui::Button::new(RichText::new("✕").color(theme::colors::DANGER)).small(),
-                                    )
-                                    .on_hover_text("Delete")
-                                    .clicked()
-                            {
-                                delete = Some(idx);
-                            }
-                        });
+                        if depth > 0
+                            && is_dir
+                            && ui
+                                .add(egui::Button::new(RichText::new("Exclude").color(theme::colors::ACCENT)).small())
+                                .on_hover_text("Exclude this folder from future scans")
+                                .clicked()
+                        {
+                            exclude = Some(idx);
+                        }
+                    });
+                    row.col(|ui| {
+                        if depth > 0
+                            && ui
+                                .add_enabled(
+                                    !scanning,
+                                    egui::Button::new(RichText::new("Delete").color(theme::colors::DANGER)).small(),
+                                )
+                                .on_hover_text("Permanently delete (asks first)")
+                                .clicked()
+                        {
+                            delete = Some(idx);
+                        }
                     });
                 });
             });
@@ -1634,6 +1834,11 @@ impl WyvernScanApp {
     }
 }
 
+/// A table header cell: bold, in the accent colour.
+fn header_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).strong().color(theme::colors::ACCENT));
+}
+
 /// Uploads the brand logo as a texture. The pixels are raw RGBA baked in at
 /// compile time (generated by `assets/make_icon.py`), so no image-decoding
 /// dependency is needed. 96px: shown at 24pt in the toolbar and 96pt on the
@@ -1704,6 +1909,98 @@ fn paint_ellipsized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `draw` headlessly at the given window width for a few frames (a
+    /// table hides its first frame while it measures) and returns every piece
+    /// of text painted in the last one, with its screen rectangle.
+    fn painted_text(ctx: &egui::Context, window_w: f32, mut draw: impl FnMut(&mut Ui)) -> Vec<(String, egui::Rect)> {
+        let mut out = Vec::new();
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(window_w, 600.0))),
+                ..Default::default()
+            };
+            let full = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
+            });
+            out = full
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.visual_bounding_rect())),
+                    _ => None,
+                })
+                .collect();
+        }
+        out
+    }
+
+    fn node(name: &str, is_dir: bool, size: u64, parent: Option<usize>, children: Vec<usize>) -> Node {
+        Node { name: name.into(), is_dir, size, parent, children, ..Default::default() }
+    }
+
+    fn sample_app() -> WyvernScanApp {
+        let mut app = WyvernScanApp::default();
+        app.arena = vec![
+            node("root", true, 300, None, vec![1, 2, 3]),
+            node("a.bin", false, 100, Some(0), vec![]),
+            node("some_much_longer_file_name.iso", false, 150, Some(0), vec![]),
+            node("a_folder", true, 50, Some(0), vec![]),
+        ];
+        app
+    }
+
+    /// Rightmost edge of the text called `label` (the last column's button).
+    fn right_of(texts: &[(String, egui::Rect)], label: &str) -> f32 {
+        texts.iter().filter(|(t, _)| t == label).map(|(_, r)| r.right()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn list_view_fills_the_window_and_follows_resizes() {
+        let mut app = sample_app();
+        let ctx = egui::Context::default();
+        for w in [900.0, 1400.0, 700.0] {
+            let texts = painted_text(&ctx, w, |ui| app.draw_list(ui));
+            // The Delete button sits in the last column, one column's width
+            // (70 + padding) from the right edge when the table fills the window.
+            let right = right_of(&texts, "Delete");
+            assert!(right >= w - 16.0 - 70.0 - 24.0, "window {w}: table only reaches {right}");
+        }
+    }
+
+    #[test]
+    fn list_delete_buttons_line_up_for_files_and_folders() {
+        let mut app = sample_app();
+        let ctx = egui::Context::default();
+        let texts = painted_text(&ctx, 1000.0, |ui| app.draw_list(ui));
+        let lefts: Vec<f32> = texts.iter().filter(|(t, _)| t == "Delete").map(|(_, r)| r.left()).collect();
+        assert_eq!(lefts.len(), 3, "one per row below the root");
+        assert!(lefts.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "misaligned: {lefts:?}");
+        assert_eq!(texts.iter().filter(|(t, _)| t == "Exclude").count(), 1, "folders only");
+    }
+
+    #[test]
+    fn search_results_fill_the_window_with_delete_after_the_path() {
+        let mut app = sample_app();
+        app.search = Some(SearchRun {
+            query: crate::search::Query::parse("bin").unwrap(),
+            hits: vec![1, 2],
+            next: 4,
+            sorted: None,
+            last_sort: Instant::now(),
+            started: Instant::now(),
+            finished: Some(Duration::ZERO),
+        });
+        let ctx = egui::Context::default();
+        for w in [900.0, 1400.0, 700.0] {
+            let texts = painted_text(&ctx, w, |ui| app.draw_search_results(ui));
+            let delete_left = texts.iter().filter(|(t, _)| t == "Delete").map(|(_, r)| r.left()).fold(f32::MAX, f32::min);
+            let path_left = texts.iter().filter(|(t, _)| t == "Path").map(|(_, r)| r.left()).fold(f32::MAX, f32::min);
+            assert!(delete_left > path_left, "window {w}: Delete must come after Path");
+            let right = right_of(&texts, "Delete");
+            assert!(right >= w - 16.0 - 70.0 - 24.0, "window {w}: table only reaches {right}");
+        }
+    }
 
     #[test]
     fn exclusions_are_added_once_and_only_if_the_folder_exists() {

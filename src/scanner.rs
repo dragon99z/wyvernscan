@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 /// `String` allocates and copies its bytes every time; cloning an
 /// `Arc<str>` is one atomic increment. The name is never mutated after
 /// creation, so there's no downside to the shared ownership.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Node {
     pub name: Arc<str>,
     pub is_dir: bool,
@@ -33,6 +33,22 @@ pub struct Node {
     /// label and can't be joined onto `root_path` like a normal path
     /// component. `None` for every ordinary node.
     pub abs_path: Option<PathBuf>,
+    /// Seconds since the Unix epoch; 0 = unknown (not stat'ed, pre-1970, or
+    /// the filesystem doesn't record it). `u32` rather than a `SystemTime` to
+    /// keep a Node small: it is cloned millions of times per live snapshot.
+    /// shortcut: ends in 2106, switch to u64 then.
+    pub created: u32,
+    pub modified: u32,
+}
+
+/// `(created, modified)` of a directory entry, as `Node` stores them.
+fn times_of(m: &std::fs::Metadata) -> (u32, u32) {
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+    };
+    (secs(m.created()), secs(m.modified()))
 }
 
 pub struct ScanResult {
@@ -144,10 +160,10 @@ struct Batch {
     parent: usize,
     /// That directory's real path, handed back only for the progress line.
     path: PathBuf,
-    /// `(name, size, kind)`. A directory's path is kept as a `PathBuf` (not
-    /// rebuilt from the lossy `name`) so non-UTF-8 names still resolve to the
-    /// right directory.
-    entries: Vec<(Arc<str>, u64, EntryKind)>,
+    /// `(name, size, kind, (created, modified))`. A directory's path is kept
+    /// as a `PathBuf` (not rebuilt from the lossy `name`) so non-UTF-8 names
+    /// still resolve to the right directory.
+    entries: Vec<(Arc<str>, u64, EntryKind, (u32, u32))>,
     errors: u64,
 }
 
@@ -412,21 +428,28 @@ fn read_batch(parent: usize, path: PathBuf, filter: &ScanFilter) -> Batch {
                 if ft.is_dir() {
                     let p = e.path();
                     if filter.should_skip_dir(&p) {
-                        entries.push((name, 0, EntryKind::SkippedDir));
+                        entries.push((name, 0, EntryKind::SkippedDir, (0, 0)));
                     } else {
-                        entries.push((name, 0, EntryKind::Dir(p)));
+                        // Not counted as an error if it fails: reading the
+                        // directory next will hit and count the same problem.
+                        let t = e.metadata().map_or((0, 0), |m| times_of(&m));
+                        entries.push((name, 0, EntryKind::Dir(p), t));
                     }
                 } else {
                     // Entries whose size can't be real disk usage skip the
                     // stat entirely (also cheaper): everything on a virtual
                     // filesystem, and sockets/FIFOs/device nodes.
+                    let mut times = (0, 0);
                     let size = if filter.ignore_sizes || !counts_toward_size(&ft) {
                         0
                     } else {
                         // Free on Windows (the size already came back with the
                         // directory listing); a cheap `fstatat` on Unix.
                         match e.metadata() {
-                            Ok(m) => m.len(),
+                            Ok(m) => {
+                                times = times_of(&m);
+                                m.len()
+                            }
                             Err(err) => {
                                 // Counted, so the error total and the debug
                                 // log always agree: a file whose size is
@@ -445,7 +468,7 @@ fn read_batch(parent: usize, path: PathBuf, filter: &ScanFilter) -> Batch {
                             e.path().display()
                         ));
                     }
-                    entries.push((name, size, EntryKind::File));
+                    entries.push((name, size, EntryKind::File, times));
                 }
             }
         }
@@ -571,6 +594,7 @@ fn scan_with_filter(
     let root_is_dir = root_meta.is_dir();
     let root_size = if root_is_dir { 0 } else { root_meta.len() };
 
+    let (root_created, root_modified) = times_of(&root_meta);
     let mut arena: Vec<Node> = Vec::with_capacity(1 << 16);
     arena.push(Node {
         name: root_name,
@@ -579,6 +603,8 @@ fn scan_with_filter(
         parent: None,
         children: Vec::new(),
         abs_path: None,
+        created: root_created,
+        modified: root_modified,
     });
 
     let mut file_count: u64 = if root_is_dir { 0 } else { 1 };
@@ -633,7 +659,7 @@ fn scan_with_filter(
             // sizes propagate once per directory, not once per file.
             let first = arena.len();
             let mut total = 0u64;
-            for (name, size, kind) in batch.entries {
+            for (name, size, kind, (created, modified)) in batch.entries {
                 let idx = arena.len();
                 arena.push(Node {
                     name,
@@ -642,6 +668,8 @@ fn scan_with_filter(
                     parent: Some(batch.parent),
                     children: Vec::new(),
                     abs_path: None,
+                    created,
+                    modified,
                 });
                 match kind {
                     EntryKind::Dir(p) => {
@@ -862,6 +890,7 @@ pub fn merge_roots(label: &str, results: Vec<ScanResult>) -> ScanResult {
         parent: None,
         children: Vec::new(),
         abs_path: None,
+        ..Default::default()
     }];
     const ROOT: usize = 0;
 
@@ -923,10 +952,10 @@ mod tests {
     #[test]
     fn aggregates_nested_sizes_bottom_up() {
         let mut arena = vec![
-            Node { name: "root".into(), is_dir: true, size: 0, parent: None, children: vec![1, 2], abs_path: None },
-            Node { name: "a.txt".into(), is_dir: false, size: 100, parent: Some(0), children: vec![], abs_path: None },
-            Node { name: "sub".into(), is_dir: true, size: 0, parent: Some(0), children: vec![3], abs_path: None },
-            Node { name: "b.txt".into(), is_dir: false, size: 50, parent: Some(2), children: vec![], abs_path: None },
+            Node { name: "root".into(), is_dir: true, size: 0, parent: None, children: vec![1, 2], abs_path: None, ..Default::default() },
+            Node { name: "a.txt".into(), is_dir: false, size: 100, parent: Some(0), children: vec![], abs_path: None, ..Default::default() },
+            Node { name: "sub".into(), is_dir: true, size: 0, parent: Some(0), children: vec![3], abs_path: None, ..Default::default() },
+            Node { name: "b.txt".into(), is_dir: false, size: 50, parent: Some(2), children: vec![], abs_path: None, ..Default::default() },
         ];
 
         // The real code path: each leaf's size is propagated up to every
@@ -1403,6 +1432,7 @@ garbage line
                 parent: None,
                 children: vec![],
                 abs_path: None,
+                ..Default::default()
             }],
             root: 0,
             root_path: PathBuf::from("/a"),
@@ -1420,6 +1450,7 @@ garbage line
                 parent: None,
                 children: vec![],
                 abs_path: None,
+                ..Default::default()
             }],
             root: 0,
             root_path: PathBuf::from("/b"),

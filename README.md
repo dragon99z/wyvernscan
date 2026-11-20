@@ -54,8 +54,8 @@ The binary lands at `target/release/wyvernscan` (`wyvernscan.exe` on Windows).
 WyvernScan is plain Rust, so each platform's build is the same `cargo build --release`, run **on that
 platform** (cross-compiling a GUI app from Windows is not practical; use WSL2, a VM, a Mac, or CI).
 
-**From Windows, the easy way is CI.** `.github/workflows/build.yml` builds and tests Windows, Linux and
-macOS (one universal binary for Apple Silicon and Intel) on GitHub's own runners. Push the repository
+**From Windows, the easy way is CI.** `.github/workflows/build.yml` builds and tests Windows (x86_64 and arm64), Linux (x86_64 and aarch64) and
+macOS (one universal binary for Apple Silicon and Intel) on GitHub's own runners (the arm64 ones natively). Push the repository
 to GitHub, open the **Actions** tab, pick the latest run and download the binaries from **Artifacts**.
 Pushing a tag such as `v0.1.0` (it must match the `version` in `Cargo.toml`, CI checks this) also publishes them as a GitHub Release. macOS in particular can only
 be built on a Mac (Apple's SDK is not available elsewhere), which is exactly what the CI runner is.
