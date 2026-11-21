@@ -354,7 +354,9 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   run yet; the first real run may need small fixes. The Windows and Linux arm64 jobs run on GitHub's native
   arm64 runners (`windows-11-arm`, `ubuntu-22.04-arm`) and are unverified for the same reason.
   The same jobs also build the installer and publish it as `wyvernscan-setup.exe`,
-  `wyvernscan-setup-windows-arm64.exe` and `wyvernscan-setup-<linux-x86_64|linux-aarch64|macos-universal>.tar.gz`;
+  `wyvernscan-setup-windows-arm64.exe`, `wyvernscan-setup-<linux-x86_64|linux-aarch64>.tar.gz` and
+  `wyvernscan-setup-macos-universal.zip` (a double-clickable `WyvernScan Setup.app` that asks in `osascript`
+  dialogs when stdin isn't a terminal; unsigned, so Gatekeeper needs right-click > Open);
   the updater never touches those names, so they can change freely.
 - **The CLI banner is ASCII, goes to stderr, and only shows on a terminal.**
   `banner.rs` output is plain 7-bit ASCII (a unit test enforces it, and that

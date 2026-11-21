@@ -12,6 +12,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+#[cfg(target_os = "macos")]
+use std::io::IsTerminal;
 
 // Copied here by CI (or by hand) from target/release/ before building this crate.
 static APP: &[u8] = include_bytes!("../payload/wyvernscan");
@@ -22,6 +24,17 @@ fn main() {
     let r = run();
     if let Err(e) = &r {
         eprintln!("\nInstall failed: {e}");
+    }
+    // Opened from Finder there is no terminal to read, so report the result in a dialog.
+    #[cfg(target_os = "macos")]
+    {
+        if !io::stdin().is_terminal() {
+            let msg = match &r {
+                Ok(()) => "WyvernScan is installed in your Applications folder (~/Applications).".to_string(),
+                Err(e) => format!("Install failed: {e}"),
+            };
+            let _ = dialog(&msg, "OK", &["OK"]);
+        }
     }
     // Double-clicked on Windows, the console would vanish before it can be read.
     #[cfg(windows)]
@@ -72,6 +85,14 @@ fn parse_yes(answer: &str, default: bool) -> bool {
 }
 
 fn ask(question: &str, default: bool) -> bool {
+    // Started from Finder (a double-clicked .app), stdin is not a terminal: ask in a dialog.
+    #[cfg(target_os = "macos")]
+    {
+        if !io::stdin().is_terminal() {
+            let d = if default { "Yes" } else { "No" };
+            return dialog(question, d, &["No", "Yes"]).map_or(default, |r| r.contains("returned:Yes"));
+        }
+    }
     print!("{question} [{}] ", if default { "Y/n" } else { "y/N" });
     let _ = io::stdout().flush();
     let mut s = String::new();
@@ -212,6 +233,23 @@ fn desktop_shortcut(dir: &Path, exe: &Path) -> io::Result<()> {
 }
 
 // ------------------------------------------------------------------ macOS
+
+/// Shows a native dialog and returns osascript's reply ("button returned:Yes, ...").
+/// None if it couldn't be shown or was cancelled. The text and buttons travel as
+/// arguments, not script text, so nothing needs quoting.
+#[cfg(target_os = "macos")]
+fn dialog(text: &str, default: &str, buttons: &[&str]) -> Option<String> {
+    let script = "display dialog (item 1 of argv) with title \"WyvernScan Setup\" \
+                  default button (item 2 of argv) buttons (items 3 thru -1 of argv)";
+    let out = Command::new("osascript")
+        .args(["-e", "on run argv", "-e", script, "-e", "end run"])
+        .arg(text)
+        .arg(default)
+        .args(buttons)
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
 
 #[cfg(target_os = "macos")]
 fn macos_bundle_files(app: &Path) {

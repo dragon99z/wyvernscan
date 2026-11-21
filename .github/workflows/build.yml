@@ -103,11 +103,16 @@ jobs:
           cargo test --manifest-path installer/Cargo.toml
           cargo build --release --manifest-path installer/Cargo.toml --target aarch64-apple-darwin
           cargo build --release --manifest-path installer/Cargo.toml --target x86_64-apple-darwin
-          lipo -create -output dist/wyvernscan-setup \
+          # Shipped as a double-clickable .app (zipped with ditto, which keeps
+          # bundles intact). It asks its questions in dialogs: no terminal there.
+          app="installer/target/WyvernScan Setup.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp installer/macos/Info.plist "$app/Contents/Info.plist"
+          sips -s format icns assets/icon-512.png --out "$app/Contents/Resources/icon.icns"
+          lipo -create -output "$app/Contents/MacOS/wyvernscan-setup" \
             installer/target/aarch64-apple-darwin/release/wyvernscan-setup \
             installer/target/x86_64-apple-darwin/release/wyvernscan-setup
-          tar -czf dist/wyvernscan-setup-macos-universal.tar.gz -C dist wyvernscan-setup
-          rm dist/wyvernscan-setup
+          ditto -c -k --keepParent "$app" dist/wyvernscan-setup-macos-universal.zip
 
       - uses: actions/upload-artifact@v4
         with:
