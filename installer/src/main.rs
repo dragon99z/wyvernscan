@@ -71,18 +71,47 @@ const MENU_LABEL: Option<&str> = Some("Add WyvernScan to the application menu");
 #[cfg(target_os = "macos")]
 const MENU_LABEL: Option<&str> = None;
 
+fn var(k: &str) -> Option<PathBuf> {
+    env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Where the installer offers to install; the person can change it in the window.
 fn install_dir() -> io::Result<PathBuf> {
-    let var = |k: &str| env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     #[cfg(windows)]
-    let dir = var("LOCALAPPDATA").map(|p| p.join("WyvernScan"));
+    let dir = var("LOCALAPPDATA").map(|p| p.join(APP_FOLDER));
     #[cfg(target_os = "macos")]
-    let dir = var("HOME").map(|p| p.join("Applications/WyvernScan.app"));
+    let dir = var("HOME").map(|p| p.join("Applications").join(APP_FOLDER));
     #[cfg(all(unix, not(target_os = "macos")))]
-    let dir = var("XDG_DATA_HOME")
+    let dir = data_home().map(|p| p.join(APP_FOLDER));
+    dir.ok_or_else(|| io::Error::other("can't find your user folder (LOCALAPPDATA / HOME is not set)"))
+}
+
+/// macOS installs a bundle; everywhere else a plain folder.
+const APP_FOLDER: &str = if cfg!(target_os = "macos") { "WyvernScan.app" } else { "WyvernScan" };
+
+/// A folder picked with Browse is where WyvernScan should live *in*, so add its own
+/// folder, unless the person already picked that one.
+fn app_folder_in(picked: PathBuf) -> PathBuf {
+    if picked.file_name().is_some_and(|n| n == APP_FOLDER) { picked } else { picked.join(APP_FOLDER) }
+}
+
+/// The path typed into the window. It must be absolute: a relative one would land in
+/// whatever folder the installer happened to be started from.
+fn valid_dir(typed: &str) -> io::Result<PathBuf> {
+    let p = PathBuf::from(typed.trim());
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        Err(io::Error::other("Enter a full folder path, starting from the drive letter or /"))
+    }
+}
+
+/// $XDG_DATA_HOME, default ~/.local/share: where the menu entry goes, wherever the app is.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn data_home() -> Option<PathBuf> {
+    var("XDG_DATA_HOME")
         .filter(|p| p.is_absolute()) // the XDG spec says to ignore relative values
         .or_else(|| var("HOME").map(|h| h.join(".local/share")))
-        .map(|p| p.join("WyvernScan"));
-    dir.ok_or_else(|| io::Error::other("can't find your user folder (LOCALAPPDATA / HOME is not set)"))
 }
 
 /// Writes the app (plus icon / bundle files on Unix) and returns the exe's path.
@@ -126,6 +155,16 @@ fn exe_name() -> &'static str {
 
 // ---------------------------------------------------------------- Windows
 
+/// The installer has no console, so Windows would open a visible one for every
+/// child process (PowerShell, reg): CREATE_NO_WINDOW stops that.
+#[cfg(windows)]
+fn quiet(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new(program);
+    c.creation_flags(0x0800_0000);
+    c
+}
+
 #[cfg(windows)]
 fn windows_shortcut(special_folder: &str, exe: &Path) -> io::Result<()> {
     // Paths travel in env vars, not in the script text, so no quoting can go wrong.
@@ -133,7 +172,7 @@ fn windows_shortcut(special_folder: &str, exe: &Path) -> io::Result<()> {
         $f=[Environment]::GetFolderPath($env:WS_FOLDER); \
         $s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $f 'WyvernScan.lnk')); \
         $s.TargetPath=$env:WS_EXE; $s.WorkingDirectory=Split-Path $env:WS_EXE; $s.Save()";
-    let out = Command::new("powershell")
+    let out = quiet("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("WS_FOLDER", special_folder)
         .env("WS_EXE", exe)
@@ -166,7 +205,7 @@ const LAYERS_KEY: &str = r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\App
 fn run_as_admin(exe: &Path, on: bool) -> io::Result<()> {
     // shortcut: this replaces (or, when unticked, removes) any other compatibility flags
     // already set on this exe; fine for a fresh per-user install, revisit if that matters.
-    let mut reg = Command::new("reg");
+    let mut reg = quiet("reg");
     if on {
         reg.args(["add", LAYERS_KEY, "/v"]).arg(exe).args(["/t", "REG_SZ", "/d", "~ RUNASADMIN", "/f"]);
     } else {
@@ -184,7 +223,7 @@ fn run_as_admin(exe: &Path, on: bool) -> io::Result<()> {
 /// Whether an earlier install already set the flag, so reinstalling doesn't silently undo it.
 #[cfg(windows)]
 fn admin_enabled(dir: &Path) -> bool {
-    Command::new("reg")
+    quiet("reg")
         .args(["query", LAYERS_KEY, "/v"])
         .arg(dir.join(exe_name()))
         .output()
@@ -212,8 +251,8 @@ fn desktop_entry(dir: &Path, exe: &Path) -> String {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn menu_shortcut(dir: &Path, exe: &Path) -> io::Result<()> {
-    // dir is <data home>/WyvernScan, and menus read <data home>/applications.
-    let apps = dir.parent().unwrap_or(dir).join("applications");
+    // Menus read <data home>/applications, however far from it the app was installed.
+    let apps = data_home().ok_or_else(|| io::Error::other("HOME is not set"))?.join("applications");
     fs::create_dir_all(&apps)?;
     fs::write(apps.join("wyvernscan.desktop"), desktop_entry(dir, exe))
 }
@@ -291,6 +330,18 @@ fn desktop_shortcut(dir: &Path, _exe: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_paths_must_be_absolute_and_browsed_ones_get_the_app_folder() {
+        let abs = if cfg!(windows) { r"C:\Tools" } else { "/opt/tools" };
+        assert_eq!(valid_dir(&format!("  {abs} \n")).unwrap(), PathBuf::from(abs));
+        assert!(valid_dir("").is_err() && valid_dir("tools").is_err() && valid_dir("./tools").is_err());
+
+        let picked = PathBuf::from(abs);
+        assert_eq!(app_folder_in(picked.clone()), picked.join(APP_FOLDER));
+        let already = picked.join(APP_FOLDER); // picking the app's own folder doesn't nest it
+        assert_eq!(app_folder_in(already.clone()), already);
+    }
 
     #[test]
     fn reinstall_replaces_the_app_and_keeps_the_old_copy() {

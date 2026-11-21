@@ -1,7 +1,7 @@
 //! The installer window: an options screen, then a result screen.
-use crate::{admin_enabled, install, install_dir, theme, Options, MENU_LABEL};
+use crate::{admin_enabled, app_folder_in, install, install_dir, theme, valid_dir, Options, MENU_LABEL};
 use eframe::egui::{self, RichText};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Raw RGBA baked in by assets/make_icon.py, so no image decoder is needed (same as the app).
 const ICON_256: &[u8] = include_bytes!("../../assets/icon-256.rgba");
@@ -15,6 +15,10 @@ enum Screen {
 }
 
 struct App {
+    /// The install folder as typed; checked when Install is pressed.
+    path: String,
+    path_error: Option<String>,
+    /// Where it was installed, for the result screen.
     dir: PathBuf,
     opts: Options,
     screen: Screen,
@@ -50,14 +54,20 @@ impl App {
         };
         // Pre-ticked from an earlier install, so a reinstall doesn't quietly undo it.
         let admin = admin_enabled(&dir);
-        Self { dir, opts: Options { menu: true, desktop: false, admin }, screen, logo }
+        let path = dir.display().to_string();
+        Self { path, path_error: None, dir, opts: Options { menu: true, desktop: false, admin }, screen, logo }
     }
 
     fn install(&mut self) {
-        self.screen = match install(&self.dir, &self.opts) {
+        let dir = match valid_dir(&self.path) {
+            Ok(dir) => dir,
+            Err(e) => return self.path_error = Some(e.to_string()),
+        };
+        self.screen = match install(&dir, &self.opts) {
             Ok(warnings) => Screen::Done(warnings),
             Err(e) => Screen::Failed(e.to_string()),
         };
+        self.dir = dir;
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -78,7 +88,28 @@ impl App {
         match &self.screen {
             Screen::Options => {
                 ui.label(RichText::new("Install to").color(MUTED).small());
-                ui.label(RichText::new(self.dir.display().to_string()).monospace());
+                ui.horizontal(|ui| {
+                    let browse = ui.button("Browse...").clicked();
+                    let field = egui::TextEdit::singleline(&mut self.path).font(egui::TextStyle::Monospace);
+                    if ui.add_sized([ui.available_width(), 24.0], field).changed() {
+                        self.path_error = None;
+                    }
+                    if browse {
+                        // Blocks while the system dialog is open, like the app's own pickers.
+                        let start = Path::new(&self.path).parent().filter(|p| p.is_dir());
+                        let mut dialog = rfd::FileDialog::new().set_title("Choose where to install WyvernScan");
+                        if let Some(start) = start {
+                            dialog = dialog.set_directory(start);
+                        }
+                        if let Some(picked) = dialog.pick_folder() {
+                            self.path = app_folder_in(picked).display().to_string();
+                            self.path_error = None;
+                        }
+                    }
+                });
+                if let Some(e) = &self.path_error {
+                    ui.colored_label(DANGER, e);
+                }
                 ui.add_space(12.0);
                 if let Some(label) = MENU_LABEL {
                     ui.checkbox(&mut self.opts.menu, label);
@@ -152,7 +183,7 @@ mod tests {
     fn every_screen_draws_and_install_reaches_done() {
         let ctx = egui::Context::default();
         let mut app = App::new(&ctx);
-        app.dir = std::env::temp_dir().join(format!("wyvernscan-gui-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wyvernscan-gui-test-{}", std::process::id()));
         app.opts = Options { menu: false, desktop: false, admin: false };
         let frame = |app: &mut App| {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -161,13 +192,19 @@ mod tests {
         };
 
         frame(&mut app); // options screen
+        app.path = "relative/folder".into(); // refused, and the window stays on the options screen
         app.install();
-        assert!(matches!(&app.screen, Screen::Done(w) if w.is_empty()));
+        assert!(app.path_error.is_some() && matches!(app.screen, Screen::Options));
+        frame(&mut app);
+        app.path = dir.display().to_string(); // a typed, non-default path
+        app.install();
+        assert!(matches!(&app.screen, Screen::Done(w) if w.is_empty()) && app.dir == dir);
+        assert!(dir.join("wyvernscan").exists() || dir.join("wyvernscan.exe").exists());
         frame(&mut app);
         app.screen = Screen::Done(vec!["Desktop shortcut could not be set up: boom".into()]);
         frame(&mut app);
         app.screen = Screen::Failed("boom".into());
         frame(&mut app);
-        std::fs::remove_dir_all(&app.dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

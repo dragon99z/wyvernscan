@@ -43,11 +43,12 @@ Each [release](https://github.com/dragon99z/wyvernscan/releases) has a `wyvernsc
 platform (`wyvernscan-setup-windows-x86_64.exe`, `wyvernscan-setup-windows-arm64.exe`,
 `wyvernscan-setup-linux-x86_64.tar.gz`, `wyvernscan-setup-linux-aarch64.tar.gz`,
 `wyvernscan-setup-macos-universal.zip`). It carries the app, needs no admin rights, and installs for
-the current user only. Its window lets you choose a Start/application menu entry and a desktop shortcut
-(and, on Windows, whether WyvernScan should always run as administrator, which the NTFS fast scan needs;
-Windows then asks for permission on every start):
+the current user only. Its window lets you change the install folder (type it, or **Browse...**), and choose
+a Start/application menu entry and a desktop shortcut (and, on Windows, whether WyvernScan should always
+run as administrator, which the NTFS fast scan needs; Windows then asks for permission on every start).
+The default folders:
 
-| OS | Installed to |
+| OS | Default install folder |
 |---|---|
 | Windows | `%LOCALAPPDATA%\WyvernScan\` |
 | Linux | `~/.local/share/WyvernScan/` (`$XDG_DATA_HOME` is respected) |
