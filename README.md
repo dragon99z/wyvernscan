@@ -37,6 +37,24 @@ tree and a squarified treemap — and delete straight from either view.
 | **Delete from either view** | With a confirmation prompt. |
 | **Auto-update** | At startup the GUI checks GitHub for a newer release and installs it (takes effect on the next start). Untick **Auto-update** in the toolbar to turn it off; `wyvernscan --update` does it from the command line. Needs `curl` (and `tar` on Linux/macOS). |
 
+## Installing
+
+Each [release](https://github.com/dragon99z/wyvernscan/releases) has a `wyvernscan-setup` file for your
+platform (`wyvernscan-setup.exe` for Windows x64, `wyvernscan-setup-windows-arm64.exe`,
+`wyvernscan-setup-linux-x86_64.tar.gz`, `wyvernscan-setup-linux-aarch64.tar.gz`,
+`wyvernscan-setup-macos-universal.tar.gz`). It carries the app, needs no admin rights, installs for
+the current user only, and asks whether to add a Start/application menu entry and a desktop shortcut:
+
+| OS | Installed to |
+|---|---|
+| Windows | `%LOCALAPPDATA%\WyvernScan\` |
+| Linux | `~/.local/share/WyvernScan/` (`$XDG_DATA_HOME` is respected) |
+| macOS | `~/Applications/WyvernScan.app` (already in Launchpad, so it only asks about the desktop) |
+
+Run it again to reinstall; the previous exe is kept next to it as `wyvernscan.old`. The auto-updater keeps
+working on an installed copy. There is no uninstaller yet: delete that folder and any shortcuts.
+The installer is the std-only crate in [`installer/`](installer); CI builds it right after the app.
+
 ## Quick start
 
 ```bash

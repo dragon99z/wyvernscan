@@ -27,6 +27,7 @@ available** — this one fact shapes several decisions below.
 | `build.rs` | Embeds `assets/icon.ico` into the Windows `.exe` via `winresource` (Windows hosts only, fail-soft). |
 | `assets/` | `icon_base.svg` (ring + field), `icon_stripes.svg` and `dragon_head.png` (the artwork) are the sources of truth; `make_icon.py` composites them and regenerates `icon.ico`, `icon-512.png` and the raw `icon-256.rgba` / `icon-96.rgba` that `main.rs` and `app.rs` embed with `include_bytes!`. |
 | `updater.rs` | Self-update from the latest GitHub release: `curl` for the API + download, `tar` to unpack, then swaps the running exe. Pure `std` + `serde_json`; used by the GUI (background thread at startup, `Persisted::auto_update`) and `wyvernscan --update`. |
+| `installer/` | Separate std-only crate (own `[workspace]`, not part of the app's build) that embeds the built app from `installer/payload/wyvernscan` and installs it per user, with optional menu/desktop shortcuts. CI copies the app into `payload/` and builds it after the app; build it locally the same way. Windows `.lnk` via PowerShell, macOS `.app` bundle + `sips` icon, Linux `.desktop` files. Linux is tested here; the Windows and macOS paths are unverified (no such machine). |
 | `win_integration.rs` | **Windows only.** Hand-rolled FFI: console allocation (`--debug`), console attach for `--cli`, elevation check, restart-as-admin. |
 
 ## Building and testing here (sandbox-only workaround)
@@ -352,6 +353,9 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   tests on each, and attaches binaries to a release on `v*` tags. It has not been
   run yet; the first real run may need small fixes. The Windows and Linux arm64 jobs run on GitHub's native
   arm64 runners (`windows-11-arm`, `ubuntu-22.04-arm`) and are unverified for the same reason.
+  The same jobs also build the installer and publish it as `wyvernscan-setup.exe`,
+  `wyvernscan-setup-windows-arm64.exe` and `wyvernscan-setup-<linux-x86_64|linux-aarch64|macos-universal>.tar.gz`;
+  the updater never touches those names, so they can change freely.
 - **The CLI banner is ASCII, goes to stderr, and only shows on a terminal.**
   `banner.rs` output is plain 7-bit ASCII (a unit test enforces it, and that
   every line fits 79 columns) because box-drawing characters garble on legacy

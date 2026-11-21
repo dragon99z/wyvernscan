@@ -1,6 +1,7 @@
 # Builds and tests WyvernScan on Windows, Linux and macOS, and keeps the
-# resulting binaries as downloadable artifacts. Push a tag like `v0.1.0` to
-# also publish them as a GitHub Release.
+# resulting binaries (and the matching wyvernscan-setup installers) as
+# downloadable artifacts. Push a tag like `v0.1.0` to also publish them as a
+# GitHub Release.
 name: Build
 
 on:
@@ -20,14 +21,18 @@ jobs:
         include:
           # `exe` is the release asset name; the x86_64 one keeps its original
           # name so existing installs can still self-update.
+          # `setup` is the matching installer asset (Linux/macOS ones are named from
+          # `name` in their build steps).
           - name: windows-x86_64
             os: windows-latest
             exe: wyvernscan.exe
+            setup: wyvernscan-setup.exe
           # arm64 is built natively on GitHub's arm64 runners (free for public
           # repos): cross-compiling a GUI app is not practical.
           - name: windows-arm64
             os: windows-11-arm
             exe: wyvernscan-windows-arm64.exe
+            setup: wyvernscan-setup-windows-arm64.exe
           # An older Ubuntu on purpose: a binary built against an older glibc
           # also runs on newer distros, but not the other way round.
           - name: linux-x86_64
@@ -60,16 +65,25 @@ jobs:
         shell: bash
         run: |
           cargo build --release
-          mkdir dist
+          mkdir dist installer/payload
           cp target/release/wyvernscan.exe dist/${{ matrix.exe }}
+          # The installer embeds the app, so it is built right after it.
+          cp target/release/wyvernscan.exe installer/payload/wyvernscan
+          cargo test --manifest-path installer/Cargo.toml
+          cargo build --release --manifest-path installer/Cargo.toml
+          cp installer/target/release/wyvernscan-setup.exe dist/${{ matrix.setup }}
 
       # --- Linux (x86_64 and aarch64) ---------------------------------------
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo build --release
-          mkdir dist
+          mkdir dist installer/payload
           tar -czf dist/wyvernscan-${{ matrix.name }}.tar.gz -C target/release wyvernscan
+          cp target/release/wyvernscan installer/payload/wyvernscan
+          cargo test --manifest-path installer/Cargo.toml
+          cargo build --release --manifest-path installer/Cargo.toml
+          tar -czf dist/wyvernscan-setup-${{ matrix.name }}.tar.gz -C installer/target/release wyvernscan-setup
 
       # --- macOS: one universal binary for Apple Silicon and Intel ----------
       - name: Build (macOS universal)
@@ -83,7 +97,17 @@ jobs:
             target/aarch64-apple-darwin/release/wyvernscan \
             target/x86_64-apple-darwin/release/wyvernscan
           tar -czf dist/wyvernscan-macos-universal.tar.gz -C dist wyvernscan
-          rm dist/wyvernscan
+          mkdir installer/payload
+          mv dist/wyvernscan installer/payload/wyvernscan
+          # The installer is universal too, and carries the universal app.
+          cargo test --manifest-path installer/Cargo.toml
+          cargo build --release --manifest-path installer/Cargo.toml --target aarch64-apple-darwin
+          cargo build --release --manifest-path installer/Cargo.toml --target x86_64-apple-darwin
+          lipo -create -output dist/wyvernscan-setup \
+            installer/target/aarch64-apple-darwin/release/wyvernscan-setup \
+            installer/target/x86_64-apple-darwin/release/wyvernscan-setup
+          tar -czf dist/wyvernscan-setup-macos-universal.tar.gz -C dist wyvernscan-setup
+          rm dist/wyvernscan-setup
 
       - uses: actions/upload-artifact@v4
         with:
