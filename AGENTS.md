@@ -27,7 +27,7 @@ available** — this one fact shapes several decisions below.
 | `build.rs` | Embeds `assets/icon.ico` into the Windows `.exe` via `winresource` (Windows hosts only, fail-soft). |
 | `assets/` | `icon_base.svg` (ring + field), `icon_stripes.svg` and `dragon_head.png` (the artwork) are the sources of truth; `make_icon.py` composites them and regenerates `icon.ico`, `icon-512.png` and the raw `icon-256.rgba` / `icon-96.rgba` that `main.rs` and `app.rs` embed with `include_bytes!`. |
 | `updater.rs` | Self-update from the latest GitHub release: `curl` for the API + download, `tar` to unpack, then swaps the running exe. Pure `std` + `serde_json`; used by the GUI (background thread at startup, `Persisted::auto_update`) and `wyvernscan --update`. |
-| `installer/` | Separate std-only crate (own `[workspace]`, not part of the app's build) that embeds the built app from `installer/payload/wyvernscan` and installs it per user, with optional menu/desktop shortcuts. CI copies the app into `payload/` and builds it after the app; build it locally the same way. Windows `.lnk` via PowerShell, macOS `.app` bundle + `sips` icon, Linux `.desktop` files. Linux is tested here; the Windows and macOS paths are unverified (no such machine). |
+| `installer/` | Separate crate (own `[workspace]`, not part of the app's build; same `eframe`/`egui` 0.27 as the app, and it reuses `src/theme.rs` via `#[path]`) that embeds the built app from `installer/payload/wyvernscan` and installs it per user. `main.rs` is the install logic (no UI in it), `gui.rs` the egui window (options screen, then result screen). Options: menu shortcut, desktop shortcut and, Windows only, "always run as administrator" (the per-user `AppCompatFlags\Layers` `~ RUNASADMIN` value, set with `reg`, pre-ticked from an earlier install). CI copies the app into `payload/` and builds it after the app; build it locally the same way. Windows `.lnk` via PowerShell, macOS `.app` bundle + `sips` icon, Linux `.desktop` files. The Linux path was run here under Xvfb (real clicks, screenshots); the Windows and macOS paths are unverified (no such machine). |
 | `win_integration.rs` | **Windows only.** Hand-rolled FFI: console allocation (`--debug`), console attach for `--cli`, elevation check, restart-as-admin. |
 
 ## Building and testing here (sandbox-only workaround)
@@ -353,11 +353,12 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   tests on each, and attaches binaries to a release on `v*` tags. It has not been
   run yet; the first real run may need small fixes. The Windows and Linux arm64 jobs run on GitHub's native
   arm64 runners (`windows-11-arm`, `ubuntu-22.04-arm`) and are unverified for the same reason.
-  The same jobs also build the installer and publish it as `wyvernscan-setup.exe`,
-  `wyvernscan-setup-windows-arm64.exe`, `wyvernscan-setup-<linux-x86_64|linux-aarch64>.tar.gz` and
-  `wyvernscan-setup-macos-universal.zip` (a double-clickable `WyvernScan Setup.app` that asks in `osascript`
-  dialogs when stdin isn't a terminal; unsigned, so Gatekeeper needs right-click > Open);
-  the updater never touches those names, so they can change freely.
+  The same jobs also build the installer and publish it as `wyvernscan-setup-windows-<x86_64|arm64>.exe`,
+  `wyvernscan-setup-<linux-x86_64|linux-aarch64>.tar.gz` and `wyvernscan-setup-macos-universal.zip`
+  (a double-clickable `WyvernScan Setup.app`; unsigned, so Gatekeeper needs right-click > Open);
+  the updater never touches those names, so they can change freely. The Windows x86_64 app is also
+  published once more as plain `wyvernscan.exe`, only because installs from before the naming change
+  look for exactly that name to self-update; remove that copy once they have moved on.
 - **The CLI banner is ASCII, goes to stderr, and only shows on a terminal.**
   `banner.rs` output is plain 7-bit ASCII (a unit test enforces it, and that
   every line fits 79 columns) because box-drawing characters garble on legacy
@@ -394,7 +395,7 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   across Linux and macOS is genuinely risk-prone in a way that declaring a
   handful of `extern "system"` function signatures isn't.
 - **The updater shells out to `curl`/`tar` instead of adding an HTTP crate,** and its asset names
-  (`wyvernscan.exe`, `wyvernscan-windows-arm64.exe`, `wyvernscan-linux-x86_64.tar.gz`, `wyvernscan-linux-aarch64.tar.gz`, `wyvernscan-macos-universal.tar.gz`) must match
+  (`wyvernscan-windows-x86_64.exe`, `wyvernscan-windows-arm64.exe`, `wyvernscan-linux-x86_64.tar.gz`, `wyvernscan-linux-aarch64.tar.gz`, `wyvernscan-macos-universal.tar.gz`) must match
   `.github/workflows/build.yml`. It compares the release tag to `CARGO_PKG_VERSION`, so **a tag must
   point at a commit whose `Cargo.toml` already has that version** (CI enforces it; `v0.1.1` once
   pointed at a `0.1.0` commit and shipped a binary whose banner said v0.1.0). Windows swaps the

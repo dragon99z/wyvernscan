@@ -1,7 +1,8 @@
-# The installer is its own tiny crate (std only) so the main app's build and
+# The installer is its own small crate so the main app's build and
 # dependencies stay untouched. CI builds the app first, copies it to
 # payload/wyvernscan, and this crate embeds it. The empty [workspace] keeps
-# cargo from treating it as part of the root package.
+# cargo from treating it as part of the root package. The egui/eframe
+# versions and features match the app's, so the window looks and runs the same.
 [package]
 name = "wyvernscan-setup"
 version = "0.1.0"
@@ -9,6 +10,10 @@ edition = "2021"
 publish = false
 
 [workspace]
+
+[dependencies]
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.27"
 
 [profile.release]
 opt-level = "s"

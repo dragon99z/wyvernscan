@@ -40,10 +40,12 @@ tree and a squarified treemap — and delete straight from either view.
 ## Installing
 
 Each [release](https://github.com/dragon99z/wyvernscan/releases) has a `wyvernscan-setup` file for your
-platform (`wyvernscan-setup.exe` for Windows x64, `wyvernscan-setup-windows-arm64.exe`,
+platform (`wyvernscan-setup-windows-x86_64.exe`, `wyvernscan-setup-windows-arm64.exe`,
 `wyvernscan-setup-linux-x86_64.tar.gz`, `wyvernscan-setup-linux-aarch64.tar.gz`,
-`wyvernscan-setup-macos-universal.zip`). It carries the app, needs no admin rights, installs for
-the current user only, and asks whether to add a Start/application menu entry and a desktop shortcut:
+`wyvernscan-setup-macos-universal.zip`). It carries the app, needs no admin rights, and installs for
+the current user only. Its window lets you choose a Start/application menu entry and a desktop shortcut
+(and, on Windows, whether WyvernScan should always run as administrator, which the NTFS fast scan needs;
+Windows then asks for permission on every start):
 
 | OS | Installed to |
 |---|---|
@@ -51,12 +53,12 @@ the current user only, and asks whether to add a Start/application menu entry an
 | Linux | `~/.local/share/WyvernScan/` (`$XDG_DATA_HOME` is respected) |
 | macOS | `~/Applications/WyvernScan.app` (already in Launchpad, so it only asks about the desktop) |
 
-On macOS, unzip it and double-click **WyvernScan Setup**; the questions appear as dialogs. The app isn't
+On macOS, unzip it and double-click **WyvernScan Setup**. The app isn't
 signed, so the first time use right-click > **Open** (or *Open Anyway* in System Settings > Privacy & Security).
 
 Run it again to reinstall; the previous exe is kept next to it as `wyvernscan.old`. The auto-updater keeps
 working on an installed copy. There is no uninstaller yet: delete that folder and any shortcuts.
-The installer is the std-only crate in [`installer/`](installer); CI builds it right after the app.
+The installer is the egui crate in [`installer/`](installer); CI builds it right after the app.
 
 ## Quick start
 

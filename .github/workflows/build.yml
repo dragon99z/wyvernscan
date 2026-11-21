@@ -19,14 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `exe` is the release asset name; the x86_64 one keeps its original
-          # name so existing installs can still self-update.
-          # `setup` is the matching installer asset (Linux/macOS ones are named from
-          # `name` in their build steps).
+          # `exe` is the release asset name and `setup` the matching installer asset
+          # (Linux/macOS ones are named from `name` in their build steps).
           - name: windows-x86_64
             os: windows-latest
-            exe: wyvernscan.exe
-            setup: wyvernscan-setup.exe
+            exe: wyvernscan-windows-x86_64.exe
+            setup: wyvernscan-setup-windows-x86_64.exe
           # arm64 is built natively on GitHub's arm64 runners (free for public
           # repos): cross-compiling a GUI app is not practical.
           - name: windows-arm64
@@ -47,7 +45,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.99.1
 
+      # The installer is a separate crate with its own target dir (and its own egui build).
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            installer
 
       # The CLI banner and the self-updater both read the version from
       # Cargo.toml, so a tag on a commit that wasn't bumped ships a stale version.
@@ -67,9 +70,14 @@ jobs:
           cargo build --release
           mkdir dist installer/payload
           cp target/release/wyvernscan.exe dist/${{ matrix.exe }}
-          # The installer embeds the app, so it is built right after it.
+          # Installs from before the naming change look for exactly `wyvernscan.exe`
+          # to self-update, so the x86_64 build is also published under that name.
+          # Drop this once those installs have moved on.
+          if [ "${{ matrix.name }}" = "windows-x86_64" ]; then cp target/release/wyvernscan.exe dist/wyvernscan.exe; fi
+          # The installer embeds the app, so it is built right after it. (--release so
+          # the tests reuse the dependencies the release build compiles anyway.)
           cp target/release/wyvernscan.exe installer/payload/wyvernscan
-          cargo test --manifest-path installer/Cargo.toml
+          cargo test --release --manifest-path installer/Cargo.toml
           cargo build --release --manifest-path installer/Cargo.toml
           cp installer/target/release/wyvernscan-setup.exe dist/${{ matrix.setup }}
 
@@ -81,7 +89,7 @@ jobs:
           mkdir dist installer/payload
           tar -czf dist/wyvernscan-${{ matrix.name }}.tar.gz -C target/release wyvernscan
           cp target/release/wyvernscan installer/payload/wyvernscan
-          cargo test --manifest-path installer/Cargo.toml
+          cargo test --release --manifest-path installer/Cargo.toml
           cargo build --release --manifest-path installer/Cargo.toml
           tar -czf dist/wyvernscan-setup-${{ matrix.name }}.tar.gz -C installer/target/release wyvernscan-setup
 
@@ -100,11 +108,10 @@ jobs:
           mkdir installer/payload
           mv dist/wyvernscan installer/payload/wyvernscan
           # The installer is universal too, and carries the universal app.
-          cargo test --manifest-path installer/Cargo.toml
+          cargo test --release --manifest-path installer/Cargo.toml
           cargo build --release --manifest-path installer/Cargo.toml --target aarch64-apple-darwin
           cargo build --release --manifest-path installer/Cargo.toml --target x86_64-apple-darwin
-          # Shipped as a double-clickable .app (zipped with ditto, which keeps
-          # bundles intact). It asks its questions in dialogs: no terminal there.
+          # Shipped as a double-clickable .app (zipped with ditto, which keeps bundles intact).
           app="installer/target/WyvernScan Setup.app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp installer/macos/Info.plist "$app/Contents/Info.plist"

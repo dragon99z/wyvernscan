@@ -21,7 +21,7 @@ pub enum Outcome {
 /// The release asset for this platform, or `None` when CI doesn't build one.
 fn asset() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some("wyvernscan.exe"),
+        ("windows", "x86_64") => Some("wyvernscan-windows-x86_64.exe"),
         ("windows", "aarch64") => Some("wyvernscan-windows-arm64.exe"),
         ("linux", "x86_64") => Some("wyvernscan-linux-x86_64.tar.gz"),
         ("linux", "aarch64") => Some("wyvernscan-linux-aarch64.tar.gz"),

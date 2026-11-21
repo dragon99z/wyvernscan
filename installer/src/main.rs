@@ -3,110 +3,73 @@
 //!   Windows  %LOCALAPPDATA%\WyvernScan\
 //!   Linux    $XDG_DATA_HOME/WyvernScan/ (default ~/.local/share/WyvernScan/)
 //!   macOS    ~/Applications/WyvernScan.app
-//! Std only, like the app itself. The few things std can't do (a Windows .lnk,
-//! a macOS .icns) shell out to the OS tools (PowerShell, sips), as updater.rs
-//! does with curl.
+//! The window is egui (gui.rs); this file is the install logic, which has no UI
+//! in it. The few things std can't do (a Windows .lnk or registry value, a macOS
+//! .icns) shell out to the OS tools (PowerShell, reg, sips), as updater.rs does
+//! with curl.
+// A GUI program: no console window on Windows. Not for tests, which print to cargo.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
+mod gui;
+// The app's own theme, so the installer looks like it; the treemap palette goes unused here.
+#[allow(dead_code)]
+#[path = "../../src/theme.rs"]
+mod theme;
+
 use std::{
-    env, fs,
-    io::{self, Write},
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
-#[cfg(target_os = "macos")]
-use std::io::IsTerminal;
 
 // Copied here by CI (or by hand) from target/release/ before building this crate.
 static APP: &[u8] = include_bytes!("../payload/wyvernscan");
 #[cfg(unix)]
 static ICON: &[u8] = include_bytes!("../../assets/icon-512.png");
 
-fn main() {
-    let r = run();
-    if let Err(e) = &r {
-        eprintln!("\nInstall failed: {e}");
-    }
-    // Opened from Finder there is no terminal to read, so report the result in a dialog.
-    #[cfg(target_os = "macos")]
-    {
-        if !io::stdin().is_terminal() {
-            let msg = match &r {
-                Ok(()) => "WyvernScan is installed in your Applications folder (~/Applications).".to_string(),
-                Err(e) => format!("Install failed: {e}"),
-            };
-            let _ = dialog(&msg, "OK", &["OK"]);
+fn main() -> eframe::Result<()> {
+    gui::run()
+}
+
+/// What the person ticked in the window.
+struct Options {
+    menu: bool,
+    desktop: bool,
+    /// Windows only: always start WyvernScan elevated.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    admin: bool,
+}
+
+/// Installs the app, then the optional extras. Returns one line per extra that
+/// failed: a missing shortcut shouldn't undo a good install.
+fn install(dir: &Path, o: &Options) -> io::Result<Vec<String>> {
+    let exe = install_files(dir)?;
+    let mut warnings = Vec::new();
+    let mut check = |what: &str, r: io::Result<()>| {
+        if let Err(e) = r {
+            warnings.push(format!("{what} could not be set up: {e}"));
         }
+    };
+    #[cfg(target_os = "macos")]
+    check("App icon", macos_icon(dir));
+    if o.menu {
+        check("Menu shortcut", menu_shortcut(dir, &exe));
     }
-    // Double-clicked on Windows, the console would vanish before it can be read.
+    if o.desktop {
+        check("Desktop shortcut", desktop_shortcut(dir, &exe));
+    }
     #[cfg(windows)]
-    {
-        print!("\nPress Enter to close...");
-        let _ = io::stdout().flush();
-        let _ = io::stdin().read_line(&mut String::new());
-    }
-    std::process::exit(r.is_err() as i32);
+    check("Run as administrator", run_as_admin(&exe, o.admin));
+    Ok(warnings)
 }
 
-fn run() -> io::Result<()> {
-    let dir = install_dir()?;
-    println!("WyvernScan setup\n\nInstalling to {}\n", dir.display());
-
-    // Asked before anything is written, so Ctrl+C here leaves nothing behind.
-    let menu = MENU_QUESTION.is_some_and(|q| ask(q, true));
-    let desktop = ask("Create a desktop shortcut?", false);
-
-    let exe = install_files(&dir)?;
-    println!("Installed {}", exe.display());
-
-    // A failed shortcut shouldn't undo a good install: warn and carry on.
-    if menu {
-        report("Start menu / application menu shortcut", menu_shortcut(&dir, &exe));
-    }
-    if desktop {
-        report("Desktop shortcut", desktop_shortcut(&dir, &exe));
-    }
-    println!("\nDone.");
-    Ok(())
-}
-
-fn report(what: &str, r: io::Result<()>) {
-    match r {
-        Ok(()) => println!("Created: {what}"),
-        Err(e) => eprintln!("Warning: {what} not created: {e}"),
-    }
-}
-
-/// Anything but yes/no (or an empty/closed stdin, as in a piped install) keeps the default.
-fn parse_yes(answer: &str, default: bool) -> bool {
-    match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        _ => default,
-    }
-}
-
-fn ask(question: &str, default: bool) -> bool {
-    // Started from Finder (a double-clicked .app), stdin is not a terminal: ask in a dialog.
-    #[cfg(target_os = "macos")]
-    {
-        if !io::stdin().is_terminal() {
-            let d = if default { "Yes" } else { "No" };
-            return dialog(question, d, &["No", "Yes"]).map_or(default, |r| r.contains("returned:Yes"));
-        }
-    }
-    print!("{question} [{}] ", if default { "Y/n" } else { "y/N" });
-    let _ = io::stdout().flush();
-    let mut s = String::new();
-    let _ = io::stdin().read_line(&mut s);
-    parse_yes(&s, default)
-}
-
-// macOS has no menu question: an app in ~/Applications already shows up in Launchpad.
+// macOS has no menu option: an app in ~/Applications already shows up in Launchpad.
 #[cfg(windows)]
-const MENU_QUESTION: Option<&str> = Some("Create a Start menu shortcut?");
+const MENU_LABEL: Option<&str> = Some("Create a Start menu shortcut");
 #[cfg(all(unix, not(target_os = "macos")))]
-const MENU_QUESTION: Option<&str> = Some("Add WyvernScan to your application menu?");
+const MENU_LABEL: Option<&str> = Some("Add WyvernScan to the application menu");
 #[cfg(target_os = "macos")]
-const MENU_QUESTION: Option<&str> = None;
+const MENU_LABEL: Option<&str> = None;
 
 fn install_dir() -> io::Result<PathBuf> {
     let var = |k: &str| env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -130,7 +93,7 @@ fn install_files(dir: &Path) -> io::Result<PathBuf> {
     let bin_dir = dir.to_path_buf();
     fs::create_dir_all(&bin_dir)?;
 
-    let exe = bin_dir.join(if cfg!(windows) { "wyvernscan.exe" } else { "wyvernscan" });
+    let exe = bin_dir.join(exe_name());
     // A running exe can be renamed but not overwritten (Windows: access denied,
     // Linux: "text file busy"), so move it aside first, like updater.rs does.
     let old = exe.with_extension("old");
@@ -150,8 +113,15 @@ fn install_files(dir: &Path) -> io::Result<PathBuf> {
     #[cfg(all(unix, not(target_os = "macos")))]
     fs::write(dir.join("icon.png"), ICON)?;
     #[cfg(target_os = "macos")]
-    macos_bundle_files(dir);
+    {
+        fs::create_dir_all(dir.join("Contents/Resources"))?;
+        fs::write(dir.join("Contents/Info.plist"), PLIST)?;
+    }
     Ok(exe)
+}
+
+fn exe_name() -> &'static str {
+    if cfg!(windows) { "wyvernscan.exe" } else { "wyvernscan" }
 }
 
 // ---------------------------------------------------------------- Windows
@@ -183,6 +153,47 @@ fn menu_shortcut(_dir: &Path, exe: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn desktop_shortcut(_dir: &Path, exe: &Path) -> io::Result<()> {
     windows_shortcut("Desktop", exe) // asked of Windows, so OneDrive-redirected desktops work
+}
+
+/// "Run this program as an administrator" is stored per user as a compatibility flag
+/// keyed by the exe's path, so it needs no admin rights to set and it survives the
+/// updater swapping the exe. It covers every way of starting the app (shortcuts,
+/// Explorer, Run), not just our own shortcuts.
+#[cfg(windows)]
+const LAYERS_KEY: &str = r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers";
+
+#[cfg(windows)]
+fn run_as_admin(exe: &Path, on: bool) -> io::Result<()> {
+    // shortcut: this replaces (or, when unticked, removes) any other compatibility flags
+    // already set on this exe; fine for a fresh per-user install, revisit if that matters.
+    let mut reg = Command::new("reg");
+    if on {
+        reg.args(["add", LAYERS_KEY, "/v"]).arg(exe).args(["/t", "REG_SZ", "/d", "~ RUNASADMIN", "/f"]);
+    } else {
+        reg.args(["delete", LAYERS_KEY, "/v"]).arg(exe).arg("/f");
+    }
+    let out = reg.output()?;
+    // Deleting a flag that was never set fails, and that is exactly the wanted end state.
+    if out.status.success() || !on {
+        Ok(())
+    } else {
+        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+    }
+}
+
+/// Whether an earlier install already set the flag, so reinstalling doesn't silently undo it.
+#[cfg(windows)]
+fn admin_enabled(dir: &Path) -> bool {
+    Command::new("reg")
+        .args(["query", LAYERS_KEY, "/v"])
+        .arg(dir.join(exe_name()))
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("RUNASADMIN"))
+}
+
+#[cfg(not(windows))]
+fn admin_enabled(_dir: &Path) -> bool {
+    false
 }
 
 // ------------------------------------------------------------------ Linux
@@ -234,26 +245,8 @@ fn desktop_shortcut(dir: &Path, exe: &Path) -> io::Result<()> {
 
 // ------------------------------------------------------------------ macOS
 
-/// Shows a native dialog and returns osascript's reply ("button returned:Yes, ...").
-/// None if it couldn't be shown or was cancelled. The text and buttons travel as
-/// arguments, not script text, so nothing needs quoting.
 #[cfg(target_os = "macos")]
-fn dialog(text: &str, default: &str, buttons: &[&str]) -> Option<String> {
-    let script = "display dialog (item 1 of argv) with title \"WyvernScan Setup\" \
-                  default button (item 2 of argv) buttons (items 3 thru -1 of argv)";
-    let out = Command::new("osascript")
-        .args(["-e", "on run argv", "-e", script, "-e", "end run"])
-        .arg(text)
-        .arg(default)
-        .args(buttons)
-        .output()
-        .ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_bundle_files(app: &Path) {
-    const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleName</key><string>WyvernScan</string>
@@ -264,26 +257,26 @@ fn macos_bundle_files(app: &Path) {
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 "#;
+
+/// Only the Dock/Finder icon is at stake here, so the caller reports a failure as a warning.
+#[cfg(target_os = "macos")]
+fn macos_icon(app: &Path) -> io::Result<()> {
     let res = app.join("Contents/Resources");
-    let r = fs::create_dir_all(&res)
-        .and_then(|_| fs::write(app.join("Contents/Info.plist"), PLIST))
-        .and_then(|_| fs::write(res.join("icon.png"), ICON));
-    // Only the Dock/Finder icon is at stake from here on, so failures just warn.
-    let icns = Command::new("sips")
+    fs::write(res.join("icon.png"), ICON)?;
+    let ok = Command::new("sips")
         .args(["-s", "format", "icns"])
         .arg(res.join("icon.png"))
         .arg("--out")
         .arg(res.join("icon.icns"))
-        .output();
+        .output()
+        .map(|o| o.status.success());
     let _ = fs::remove_file(res.join("icon.png"));
-    if r.is_err() || !icns.is_ok_and(|o| o.status.success()) {
-        eprintln!("Warning: app icon not created (the app will use a generic icon)");
-    }
+    if ok? { Ok(()) } else { Err(io::Error::other("sips could not convert the icon")) }
 }
 
 #[cfg(target_os = "macos")]
 fn menu_shortcut(_dir: &Path, _exe: &Path) -> io::Result<()> {
-    Ok(()) // unreachable: MENU_QUESTION is None on macOS
+    Ok(()) // unreachable: MENU_LABEL is None on macOS
 }
 
 #[cfg(target_os = "macos")]
@@ -298,13 +291,6 @@ fn desktop_shortcut(dir: &Path, _exe: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn answers_fall_back_to_the_default() {
-        assert!(parse_yes("Y\n", false) && parse_yes(" yes ", false));
-        assert!(!parse_yes("n", true) && !parse_yes("NO\r\n", true));
-        assert!(parse_yes("", true) && !parse_yes("", false) && parse_yes("maybe", true));
-    }
 
     #[test]
     fn reinstall_replaces_the_app_and_keeps_the_old_copy() {
