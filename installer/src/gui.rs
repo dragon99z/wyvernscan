@@ -199,7 +199,13 @@ mod tests {
         app.path = dir.display().to_string(); // a typed, non-default path
         app.install();
         assert!(matches!(&app.screen, Screen::Done(w) if w.is_empty()) && app.dir == dir);
-        assert!(dir.join("wyvernscan").exists() || dir.join("wyvernscan.exe").exists());
+        // On macOS the app is inside the bundle, not directly in the folder.
+        let exe = if cfg!(target_os = "macos") {
+            dir.join("Contents/MacOS/wyvernscan")
+        } else {
+            dir.join(if cfg!(windows) { "wyvernscan.exe" } else { "wyvernscan" })
+        };
+        assert!(exe.exists(), "{} was not installed", exe.display());
         frame(&mut app);
         app.screen = Screen::Done(vec!["Desktop shortcut could not be set up: boom".into()]);
         frame(&mut app);
