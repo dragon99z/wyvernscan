@@ -39,7 +39,7 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
-            Box::new(App::new(&cc.egui_ctx))
+            Ok(Box::new(App::new(&cc.egui_ctx)))
         }),
     )
 }
@@ -168,8 +168,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| self.ui(ui));
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| Self::ui(self, ui));
     }
 }
 
@@ -186,9 +186,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wyvernscan-gui-test-{}", std::process::id()));
         app.opts = Options { menu: false, desktop: false, admin: false };
         let frame = |app: &mut App| {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.ui(ui));
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.ui(ui));
             });
+            out.textures_delta.clear(); // egui panics if a texture delta is dropped unapplied
         };
 
         frame(&mut app); // options screen

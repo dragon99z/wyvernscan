@@ -10,7 +10,7 @@ A TreeSize / WizTree-style disk space explorer written in Rust.
 Scan a folder, a drive, or your entire system, then drill into an expandable
 tree and a squarified treemap — and delete straight from either view.
 
-![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
+![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![GUI](https://img.shields.io/badge/GUI-egui%20%2F%20eframe-8A2BE2)
 ![Modes](https://img.shields.io/badge/modes-GUI%20%2B%20headless%20CLI-success)
@@ -100,7 +100,7 @@ cargo build --release
   `-gnome`, `-kde` or `-gtk`). Full desktops ship this; a bare window manager may not, in which case the
   picker will not open. You can still scan from the command line (`--cli`), or switch the dialog to GTK3
   by changing the `rfd` line in `Cargo.toml` to
-  `rfd = { version = "0.14", default-features = false, features = ["gtk3"] }` and installing
+  `rfd = { version = "0.18.0", default-features = false, features = ["gtk3"] }` and installing
   `libgtk-3-dev pkg-config` (`gtk3-devel` on Fedora).
 - On Windows you can build the Linux version inside WSL2 with the same commands.
 </details>

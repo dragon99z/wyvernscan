@@ -25,7 +25,7 @@ mod imp {
     use std::path::Path;
 
     #[allow(non_snake_case)]
-    extern "system" {
+    unsafe extern "system" {
         fn GetDiskFreeSpaceExW(
             lp_directory_name: *const u16,
             lp_free_bytes_available: *mut c_void,

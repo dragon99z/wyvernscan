@@ -10,7 +10,7 @@
 //! wing-membrane tones on flat tiles; the palette is deliberately muted so a
 //! folder's color reads as a label, not noise.
 
-use egui::{Color32, Rounding, Stroke};
+use egui::{Color32, CornerRadius, Stroke};
 
 pub mod colors {
     use super::Color32;
@@ -57,45 +57,45 @@ pub fn apply(ctx: &egui::Context) {
     visuals.extreme_bg_color = BG;
     visuals.code_bg_color = ELEVATED;
     visuals.hyperlink_color = ACCENT;
-    visuals.window_rounding = Rounding::same(6.0);
-    visuals.menu_rounding = Rounding::same(6.0);
+    visuals.window_corner_radius = CornerRadius::same(6);
+    visuals.menu_corner_radius = CornerRadius::same(6);
 
     visuals.widgets.noninteractive.bg_fill = PANEL;
     visuals.widgets.noninteractive.weak_bg_fill = PANEL;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, MUTED);
-    visuals.widgets.noninteractive.rounding = Rounding::same(4.0);
+    visuals.widgets.noninteractive.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.inactive.bg_fill = ELEVATED;
     visuals.widgets.inactive.weak_bg_fill = ELEVATED;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.inactive.rounding = Rounding::same(4.0);
+    visuals.widgets.inactive.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.hovered.bg_fill = ELEVATED;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.hovered.rounding = Rounding::same(4.0);
+    visuals.widgets.hovered.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.active.bg_fill = ACCENT;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, BG);
-    visuals.widgets.active.rounding = Rounding::same(4.0);
+    visuals.widgets.active.corner_radius = CornerRadius::same(4);
 
     visuals.widgets.open.bg_fill = ELEVATED;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.open.rounding = Rounding::same(4.0);
+    visuals.widgets.open.corner_radius = CornerRadius::same(4);
 
     visuals.selection.bg_fill = ACCENT.linear_multiply(0.35);
     visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     ctx.set_visuals(visuals);
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.window_margin = egui::Margin::same(14.0);
+    style.spacing.window_margin = egui::Margin::same(14);
     style.spacing.indent = 16.0;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }

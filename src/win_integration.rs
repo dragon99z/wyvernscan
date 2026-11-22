@@ -30,7 +30,7 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[allow(non_snake_case)]
-extern "system" {
+unsafe extern "system" {
     fn AllocConsole() -> i32;
     fn AttachConsole(dwProcessId: u32) -> i32;
     fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
@@ -49,7 +49,7 @@ extern "system" {
 
 #[allow(non_snake_case)]
 #[link(name = "shell32")]
-extern "system" {
+unsafe extern "system" {
     fn ShellExecuteW(
         hwnd: *mut c_void,
         lp_operation: *const u16,

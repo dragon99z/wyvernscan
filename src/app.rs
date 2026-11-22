@@ -667,7 +667,8 @@ impl eframe::App for WyvernScanApp {
         eframe::set_value(storage, eframe::APP_KEY, &persisted);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         if let Some(msg) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.status_message = Some(msg);
         }
@@ -676,7 +677,7 @@ impl eframe::App for WyvernScanApp {
             ctx.request_repaint();
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if let Some(logo) = &self.logo {
@@ -694,7 +695,7 @@ impl eframe::App for WyvernScanApp {
 
                 ui.add_space(12.0);
                 ui.label(RichText::new("Scan mode").color(theme::colors::MUTED).small());
-                egui::ComboBox::from_id_source("scan_mode")
+                egui::ComboBox::from_id_salt("scan_mode")
                     .selected_text(self.scan_mode.label())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.scan_mode, ScanMode::Auto, ScanMode::Auto.label());
@@ -803,7 +804,7 @@ impl eframe::App for WyvernScanApp {
         self.step_search(ctx);
 
         if !self.arena.is_empty() {
-            egui::TopBottomPanel::top("breadcrumbs").show(ctx, |ui| {
+            egui::Panel::top("breadcrumbs").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let crumbs = self.breadcrumbs();
                     let last = crumbs.len().saturating_sub(1);
@@ -828,7 +829,7 @@ impl eframe::App for WyvernScanApp {
                 });
             });
 
-            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            egui::Panel::bottom("status").show(ui, |ui| {
                 ui.add_space(2.0);
                 if self.scanning {
                     self.draw_scan_progress(ui, ui.available_width().min(520.0));
@@ -894,7 +895,7 @@ impl eframe::App for WyvernScanApp {
             });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.arena.is_empty() {
                 if self.scanning {
                     self.draw_scanning_overlay(ui);
@@ -979,7 +980,7 @@ impl WyvernScanApp {
         use egui::text::{CCursor, CCursorRange};
         let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
         let chars = self.search_buf.chars().count();
-        let at = state.cursor.char_range().map_or(chars, |r| r.primary.index.min(chars));
+        let at = state.cursor.char_range().map_or(chars, |r| r.primary.index.0.min(chars));
         let byte = self.search_buf.char_indices().nth(at).map_or(self.search_buf.len(), |(b, _)| b);
         // Terms are space-separated, so never glue the preset onto a previous term.
         let text = if self.search_buf[..byte].ends_with(|c: char| !c.is_whitespace()) {
@@ -994,7 +995,7 @@ impl WyvernScanApp {
     }
 
     fn draw_search_bar(&mut self, ui: &mut Ui) {
-        let id = egui::Id::new("search_input");
+        let id = egui::Id::unique("search_input");
         ui.label(RichText::new("Search").color(theme::colors::MUTED).small());
         let resp = ui
             .add(
@@ -1013,7 +1014,7 @@ impl WyvernScanApp {
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
         let mut picked = None;
-        egui::ComboBox::from_id_source("search_insert")
+        egui::ComboBox::from_id_salt("search_insert")
             .selected_text("Insert…")
             .show_ui(ui, |ui| {
                 for (label, text) in crate::search::PRESETS {
@@ -1199,7 +1200,7 @@ impl WyvernScanApp {
         let mut entire_system_clicked = false;
         let mut pick: Option<PathBuf> = None;
 
-        egui::ComboBox::from_id_source("root_picker")
+        egui::ComboBox::from_id_salt("root_picker")
             .width(200.0)
             .selected_text(current_label)
             .show_ui(ui, |ui| {
@@ -1666,6 +1667,7 @@ impl WyvernScanApp {
                 } else {
                     egui::Stroke::new(1.0_f32, theme::colors::BG)
                 },
+                egui::StrokeKind::Middle,
             );
 
             // Labels are clipped to their own block (the shared `painter`
@@ -1724,7 +1726,13 @@ impl WyvernScanApp {
         if let Some(n) = hovered {
             let block = &blocks[n];
             let pct = block.size as f64 / total * 100.0;
-            egui::show_tooltip_at_pointer(ui.ctx(), egui::Id::new("wyvernscan_treemap_tooltip"), |ui| {
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                egui::Id::unique("wyvernscan_treemap_tooltip"),
+                egui::PopupAnchor::Pointer,
+            )
+            .show(|ui| {
                 ui.label(format!("{}\n{} ({:.1}%)", block.label, format_size(block.size, BINARY), pct));
                 if block.grouped_count > 1 {
                     ui.label(
@@ -1920,8 +1928,8 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(window_w, 600.0))),
                 ..Default::default()
             };
-            let full = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
+            let full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| draw(ui));
             });
             out = full
                 .shapes

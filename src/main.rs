@@ -89,7 +89,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Box::new(WyvernScanApp::new(cc, elevated))
+            Ok(Box::new(WyvernScanApp::new(cc, elevated)))
         }),
     );
 

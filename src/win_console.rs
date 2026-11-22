@@ -17,7 +17,7 @@ use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
 
 #[allow(non_snake_case)]
-extern "system" {
+unsafe extern "system" {
     fn AllocConsole() -> i32;
     fn SetStdHandle(nStdHandle: u32, hHandle: *mut c_void) -> i32;
 }

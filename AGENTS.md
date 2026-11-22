@@ -27,7 +27,7 @@ available** — this one fact shapes several decisions below.
 | `build.rs` | Embeds `assets/icon.ico` into the Windows `.exe` via `winresource` (Windows hosts only, fail-soft). |
 | `assets/` | `icon_base.svg` (ring + field), `icon_stripes.svg` and `dragon_head.png` (the artwork) are the sources of truth; `make_icon.py` composites them and regenerates `icon.ico`, `icon-512.png` and the raw `icon-256.rgba` / `icon-96.rgba` that `main.rs` and `app.rs` embed with `include_bytes!`. |
 | `updater.rs` | Self-update from the latest GitHub release: `curl` for the API + download, `tar` to unpack, then swaps the running exe. Pure `std` + `serde_json`; used by the GUI (background thread at startup, `Persisted::auto_update`) and `wyvernscan --update`. |
-| `installer/` | Separate crate (own `[workspace]`, not part of the app's build; same `eframe`/`egui` 0.27 as the app, and it reuses `src/theme.rs` via `#[path]`) that embeds the built app from `installer/payload/wyvernscan` and installs it per user. `main.rs` is the install logic (no UI in it), `gui.rs` the egui window (options screen, then result screen). Options: the install folder (typed or via `rfd` Browse; must be absolute, and a browsed folder gets `WyvernScan`/`WyvernScan.app` appended), menu shortcut, desktop shortcut and, Windows only, "always run as administrator" (the per-user `AppCompatFlags\Layers` `~ RUNASADMIN` value, set with `reg`, pre-ticked from the default folder's earlier install). The installer exe is a GUI-subsystem program, so every Windows child process goes through `quiet()` (`CREATE_NO_WINDOW`) or it would flash a console; its exe icon is embedded by `installer/build.rs` (`winresource`, Windows hosts only, fail-soft like the app's). The Linux menu entry always goes to `$XDG_DATA_HOME/applications`, wherever the app is installed. CI copies the app into `payload/` and builds it after the app; build it locally the same way. Windows `.lnk` via PowerShell, macOS `.app` bundle + `sips` icon, Linux `.desktop` files. The Linux path was run here under Xvfb (real clicks, screenshots); the Windows and macOS paths are unverified (no such machine). |
+| `installer/` | Separate crate (own `[workspace]`, not part of the app's build; same `eframe`/`egui` 0.37 as the app, and it reuses `src/theme.rs` via `#[path]`) that embeds the built app from `installer/payload/wyvernscan` and installs it per user. `main.rs` is the install logic (no UI in it), `gui.rs` the egui window (options screen, then result screen). Options: the install folder (typed or via `rfd` Browse; must be absolute, and a browsed folder gets `WyvernScan`/`WyvernScan.app` appended), menu shortcut, desktop shortcut and, Windows only, "always run as administrator" (the per-user `AppCompatFlags\Layers` `~ RUNASADMIN` value, set with `reg`, pre-ticked from the default folder's earlier install). The installer exe is a GUI-subsystem program, so every Windows child process goes through `quiet()` (`CREATE_NO_WINDOW`) or it would flash a console; its exe icon is embedded by `installer/build.rs` (`winresource`, Windows hosts only, fail-soft like the app's). The Linux menu entry always goes to `$XDG_DATA_HOME/applications`, wherever the app is installed. CI copies the app into `payload/` and builds it after the app; build it locally the same way. Windows `.lnk` via PowerShell, macOS `.app` bundle + `sips` icon, Linux `.desktop` files. The Linux path was run here under Xvfb (real clicks, screenshots); the Windows and macOS paths are unverified (no such machine). |
 | `win_integration.rs` | **Windows only.** Hand-rolled FFI: console allocation (`--debug`), console attach for `--cli`, elevation check, restart-as-admin. |
 
 ## Building and testing here (sandbox-only workaround)
@@ -55,7 +55,7 @@ indexmap = "=2.11.4"
 ```
 
 ...and change the `rfd` line to
-`rfd = { version = "0.14", default-features = false, features = ["gtk3"] }`
+`rfd = { version = "0.18.0", default-features = false, features = ["gtk3"] }`
 (avoids an unrelated icu4x/edition2024 chain pulled in by `rfd`'s default
 xdg-portal backend on Linux).
 
@@ -387,6 +387,14 @@ real, reported bug. Noted so the same mistake doesn't get reintroduced.
   it on Windows hosts and turns any failure into a `cargo:warning`, so a machine
   without `rc.exe` still builds. This is unverified on real Windows (no Windows
   machine in the sandbox) -- say so if asked.
+- **`rfd` has `default-features = false, features = ["xdg-portal"]`, and `eframe` lists `x11` and `wayland` itself.**
+  rfd's default `wayland` feature (only needed to parent a dialog to a Wayland window, which this
+  app never does) links `libwayland-client` through `pkg-config` at build time, so it would make
+  `libwayland-dev` a build requirement that CI and the README say isn't one. eframe 0.37 with
+  `default-features = false` enables no winit backend at all (`compile_error!` on Linux), so the
+  windowing features must be named; both load their libraries at runtime. Same in `installer/`.
+  Edition 2024 also makes every `extern` block `unsafe extern` (the Windows FFI in
+  `win_integration.rs`, `win_console.rs`, `disk_space.rs`).
 - **Prefer hand-rolled minimal FFI over a full bindings crate** for a small,
   known set of OS calls — see `win_integration.rs` (console allocation,
   elevation, `ShellExecuteW`) and the Windows half of `disk_space.rs`
