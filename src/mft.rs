@@ -514,7 +514,6 @@ fn attribute_value<R: Read + Seek>(
     off: usize,
     len: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    const MAX: u64 = 64 << 20; // a sanity bound; real lists are kilobytes
     let bad = || anyhow::anyhow!("corrupt $MFT attribute list");
     if rec.get(off + 8) == Some(&0) {
         let vlen = u32_at(rec, off + 16).ok_or_else(bad)? as usize;
@@ -522,23 +521,30 @@ fn attribute_value<R: Read + Seek>(
         return Ok(rec.get(voff..voff.checked_add(vlen).ok_or_else(bad)?).ok_or_else(bad)?.to_vec());
     }
     let ext = extent_at(rec, off, len)?;
-    if ext.size > MAX {
+    read_runs(vol, cluster, &ext.runs, ext.size)
+}
+
+/// `size` bytes of a non-resident attribute, read from the clusters of `runs`.
+fn read_runs<R: Read + Seek>(vol: &mut R, cluster: u64, runs: &[Run], size: u64) -> anyhow::Result<Vec<u8>> {
+    const MAX: u64 = 64 << 20; // a sanity bound; real lists and bitmaps are kilobytes to a few MB
+    let bad = || anyhow::anyhow!("corrupt $MFT attribute data");
+    if size > MAX {
         return Err(bad());
     }
-    let mut out = Vec::with_capacity(ext.size as usize);
-    for run in &ext.runs {
+    let mut out = Vec::with_capacity(size as usize);
+    for run in runs {
         let Some(lcn) = run.lcn else {
             return Err(bad());
         };
-        let want = run.len.checked_mul(cluster).ok_or_else(bad)?.min(ext.size - out.len() as u64) as usize;
+        let want = run.len.checked_mul(cluster).ok_or_else(bad)?.min(size - out.len() as u64) as usize;
         let mut buf = vec![0u8; want];
         read_exact_aligned(vol, lcn.checked_mul(cluster).ok_or_else(bad)?, &mut buf)?;
         out.extend_from_slice(&buf);
-        if out.len() as u64 >= ext.size {
+        if out.len() as u64 >= size {
             break;
         }
     }
-    if (out.len() as u64) < ext.size {
+    if (out.len() as u64) < size {
         return Err(bad());
     }
     Ok(out)
@@ -588,7 +594,9 @@ fn locate_mft<R: Read + Seek>(
 ) -> anyhow::Result<(u64, Vec<Run>, Option<Vec<u8>>)> {
     let mut own = None;
     let mut list = None;
-    let mut bitmap = None;
+    // The $MFT's own $BITMAP, in whatever pieces record 0 holds it (see `assemble_bitmap`).
+    let mut bitmap_value = None;
+    let mut bitmap_exts: Vec<Extent> = Vec::new();
     for (ty, off, len) in attr_positions(rec0)? {
         match ty {
             ATTR_DATA if rec0.get(off + 9) == Some(&0) => {
@@ -602,9 +610,10 @@ fn locate_mft<R: Read + Seek>(
             // lets the scan skip free records), so any trouble reading it just
             // means "read everything" rather than failing the scan.
             ATTR_BITMAP if rec0.get(off + 9) == Some(&0) => {
-                let starts_at_zero = rec0.get(off + 8) == Some(&0) || u64_at(rec0, off + 16) == Some(0);
-                if starts_at_zero {
-                    bitmap = attribute_value(vol, boot.cluster, rec0, off, len).ok();
+                if rec0.get(off + 8) == Some(&0) {
+                    bitmap_value = attribute_value(vol, boot.cluster, rec0, off, len).ok();
+                } else if let Ok(e) = extent_at(rec0, off, len) {
+                    bitmap_exts.push(e);
                 }
             }
             _ => {}
@@ -615,21 +624,24 @@ fn locate_mft<R: Read + Seek>(
         if own.lowest_vcn != 0 {
             anyhow::bail!("$MFT data attribute does not start at cluster 0");
         }
+        let bitmap = assemble_bitmap(vol, boot, bitmap_value, bitmap_exts);
         return Ok((own.size, own.runs, bitmap));
     };
 
     // Attribute list entries: type u32, entry length u16, name length u8 @6,
     // starting VCN u64 @8, file reference u64 @16. Keep the unnamed $DATA ones.
     let mut wanted: Vec<(u64, u64)> = Vec::new();
+    let mut bitmap_wanted: Vec<(u64, u64)> = Vec::new();
     let mut p = 0;
     while let (Some(ty), Some(entry_len)) = (u32_at(&list, p), u16_at(&list, p + 4)) {
         let entry_len = entry_len as usize;
         if entry_len < 26 || p + entry_len > list.len() {
             break;
         }
-        if ty == ATTR_DATA && list[p + 6] == 0 {
+        if (ty == ATTR_DATA || ty == ATTR_BITMAP) && list[p + 6] == 0 {
             if let (Some(vcn), Some(fref)) = (u64_at(&list, p + 8), u64_at(&list, p + 16)) {
-                wanted.push((vcn, fref & REF_MASK));
+                let target = if ty == ATTR_DATA { &mut wanted } else { &mut bitmap_wanted };
+                target.push((vcn, fref & REF_MASK));
             }
         }
         p += entry_len;
@@ -673,7 +685,73 @@ fn locate_mft<R: Read + Seek>(
         runs.extend(ext.runs);
     }
     let size = size.ok_or_else(|| anyhow::anyhow!("$MFT attribute list has no extent at cluster 0"))?;
+
+    // On a fragmented $MFT the $BITMAP is usually pushed out of record 0 too:
+    // fetch the extents the list places in extension records (now that the
+    // whole $MFT is mapped). Record 0's own are already in `bitmap_exts`.
+    bitmap_wanted.sort_unstable();
+    bitmap_wanted.dedup();
+    for (vcn, recno) in bitmap_wanted.into_iter().filter(|&(_, recno)| recno != 0) {
+        let found = (|| -> anyhow::Result<Option<Extent>> {
+            let rec = read_mapped_record(vol, boot, &runs, recno)?;
+            for (ty, off, len) in attr_positions(&rec)? {
+                if ty == ATTR_BITMAP && rec.get(off + 9) == Some(&0) && rec.get(off + 8) == Some(&1) {
+                    let e = extent_at(&rec, off, len)?;
+                    if e.lowest_vcn == vcn {
+                        return Ok(Some(e));
+                    }
+                }
+            }
+            Ok(None)
+        })();
+        match found {
+            Ok(Some(e)) => bitmap_exts.push(e),
+            Ok(None) => {}
+            Err(e) => crate::debug_log::log(&format!("MFT: $BITMAP extension record {recno} unusable: {e:#}")),
+        }
+    }
+    let bitmap = assemble_bitmap(vol, boot, bitmap_value, bitmap_exts);
     Ok((size, runs, bitmap))
+}
+
+/// The `$MFT`'s `$BITMAP` (bit `i` of byte `i / 8` = record `i` in use), from
+/// the pieces found: a resident value, or non-resident extents that must start
+/// at cluster 0 and follow one another without gaps. Best effort: on any
+/// trouble this logs why and returns `None`, i.e. "read the whole table".
+fn assemble_bitmap<R: Read + Seek>(
+    vol: &mut R,
+    boot: &Boot,
+    resident: Option<Vec<u8>>,
+    mut exts: Vec<Extent>,
+) -> Option<Vec<u8>> {
+    if resident.is_some() {
+        return resident;
+    }
+    if exts.is_empty() {
+        crate::debug_log::log("MFT: no usable $BITMAP attribute in record 0 or its extension records");
+        return None;
+    }
+    exts.sort_by_key(|e| e.lowest_vcn);
+    let mut runs: Vec<Run> = Vec::new();
+    let mut clusters = 0u64;
+    for e in &exts {
+        if e.lowest_vcn != clusters {
+            crate::debug_log::log(&format!(
+                "MFT: $BITMAP extents are not contiguous: expected cluster {clusters}, found {}",
+                e.lowest_vcn
+            ));
+            return None;
+        }
+        clusters += e.runs.iter().map(|r| r.len).sum::<u64>();
+        runs.extend(e.runs.iter().cloned());
+    }
+    match read_runs(vol, boot.cluster, &runs, exts[0].size) {
+        Ok(bits) => Some(bits),
+        Err(e) => {
+            crate::debug_log::log(&format!("MFT: could not read the $BITMAP: {e:#}"));
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,6 +1798,78 @@ mod tests {
         // A gap in virtual cluster numbers (extent 2 claims to start at 3).
         let e = run_scan(fragmented_volume(false, 3, 3)).err().expect("must fail").to_string();
         assert!(e.contains("not contiguous"), "{e}");
+    }
+
+    /// A fragmented `$MFT` whose `$BITMAP` is *not* (only) in record 0, like a
+    /// real, heavily used `C:` where it gets pushed into an extension record:
+    /// record 4 holds it, alone, or as the second of two extents when `split`.
+    /// `ext_vcn` is the starting cluster record 4 really claims (the list says
+    /// 0, or 1 when split), so a different value makes the list lie.
+    /// Returns the image and the bitmap `locate_mft` should hand back.
+    fn bitmap_in_extension_volume(split: bool, ext_vcn: u64) -> (Vec<u8>, Vec<u8>) {
+        let extents = [(4, 2), (20, 2)];
+        let size = if split { 2 * CLUSTER } else { 8 };
+        let mut bits = vec![0u8; size]; // filled from the real in-use flags below
+        let mut list = vec![list_entry(ATTR_DATA, 0, 0), list_entry(ATTR_DATA, 2, 3)];
+        if split {
+            list.push(list_entry(ATTR_BITMAP, 0, 0));
+            list.push(list_entry(ATTR_BITMAP, 1, 4));
+        } else {
+            list.push(list_entry(ATTR_BITMAP, 0, 4));
+        }
+        let list = list.concat();
+        let mut in_use = vec![0u8; N.div_ceil(8)];
+        let mut img = synthetic_volume_at(&extents, &[], |recs| {
+            let mut attrs = vec![
+                file_name(5, 3, "$MFT"),
+                data_nonresident(0, DATA_SIZE, &encode_runs(&extents[..1])),
+                resident(ATTR_ATTRIBUTE_LIST, &list),
+            ];
+            if split {
+                attrs.push(nonresident(ATTR_BITMAP, 0, size as u64, &encode_runs(&[(41, 1)])));
+            }
+            recs[0] = record(FILE, 0, &attrs);
+            recs[3] = record(FILE, 1 << 48, &[data_nonresident(2, 0, &encode_runs(&extents[1..]))]);
+            let (lcn, real) = if split { (42, 0) } else { (41, size as u64) };
+            recs[4] = record(FILE, 1 << 48, &[nonresident(ATTR_BITMAP, ext_vcn, real, &encode_runs(&[(lcn, 1)]))]);
+            for (i, r) in recs.iter().enumerate() {
+                if u16::from_le_bytes([r[0x16], r[0x17]]) & 1 != 0 {
+                    in_use[i / 8] |= 1 << (i % 8);
+                }
+            }
+        });
+        bits[..in_use.len()].copy_from_slice(&in_use);
+        for (i, chunk) in bits.chunks(CLUSTER).enumerate() {
+            let at = (41 + i) * CLUSTER;
+            img[at..at + chunk.len()].copy_from_slice(chunk);
+        }
+        (img, bits)
+    }
+
+    /// What `locate_mft` makes of the image's `$BITMAP`.
+    fn located_bitmap(img: Vec<u8>) -> Option<Vec<u8>> {
+        let mut dev = StrictDevice(Cursor::new(img));
+        let mut sector = vec![0u8; ALIGN as usize];
+        read_exact_aligned(&mut dev, 0, &mut sector).unwrap();
+        let boot = parse_boot(&sector).unwrap();
+        let mut rec0 = vec![0u8; boot.record_size];
+        read_exact_aligned(&mut dev, boot.mft_offset, &mut rec0).unwrap();
+        assert!(apply_fixups(&mut rec0));
+        locate_mft(&mut dev, &boot, &rec0).unwrap().2
+    }
+
+    #[test]
+    fn the_bitmap_is_found_in_extension_records() {
+        let reference = dump(&run_scan(synthetic_volume(|_| {})).unwrap());
+        for split in [false, true] {
+            let (img, expected) = bitmap_in_extension_volume(split, split as u64);
+            assert_eq!(located_bitmap(img.clone()), Some(expected), "split = {split}");
+            assert_eq!(dump(&run_scan(img).unwrap()), reference, "split = {split}");
+        }
+        // A list entry the record doesn't back up: no bitmap, but the scan still works.
+        let (img, _) = bitmap_in_extension_volume(false, 5);
+        assert_eq!(located_bitmap(img.clone()), None);
+        assert_eq!(dump(&run_scan(img).unwrap()), reference);
     }
 
     /// The GUI keeps arena indices (what's expanded, where the user is looking)
