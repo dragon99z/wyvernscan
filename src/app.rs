@@ -1930,9 +1930,10 @@ mod tests {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(window_w, 600.0))),
                 ..Default::default()
             };
-            let full = ctx.run_ui(input, |ui| {
+            let mut full = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| draw(ui));
             });
+            full.textures_delta.clear(); // egui debug-asserts if a texture delta is dropped unapplied
             out = full
                 .shapes
                 .iter()
