@@ -679,7 +679,9 @@ impl eframe::App for WyvernScanApp {
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            // Wrapped, not `horizontal`: a plain row never wraps, so on a narrow window the
+            // buttons past the right edge were simply cut off.
+            ui.horizontal_wrapped(|ui| {
                 if let Some(logo) = &self.logo {
                     ui.add(egui::Image::new(egui::load::SizedTexture::new(
                         logo.id(),
